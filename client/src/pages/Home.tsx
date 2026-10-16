@@ -1,25 +1,231 @@
-import { Button } from "@/components/ui/button";
-import { Loader2 } from "lucide-react";
-import { Streamdown } from 'streamdown';
+import { useEffect, useMemo, useState } from "react";
+import type { Session } from "@supabase/supabase-js";
+import {
+  Activity as ActivityIcon,
+  AlertTriangle,
+  Archive,
+  ArrowUpRight,
+  Box,
+  Boxes,
+  ChevronDown,
+  ChevronRight,
+  CircleHelp,
+  CloudCog,
+  Cpu,
+  Database,
+  FileClock,
+  Filter,
+  HardDrive,
+  LayoutDashboard,
+  LockKeyhole,
+  LogOut,
+  MemoryStick,
+  Menu,
+  MoreHorizontal,
+  Network,
+  Play,
+  Plus,
+  RefreshCw,
+  Search,
+  Server,
+  Settings2,
+  ShieldCheck,
+  Square,
+  TerminalSquare,
+  Trash2,
+  TriangleAlert,
+  Users,
+  X,
+  Zap,
+} from "lucide-react";
+import {
+  initialActivity,
+  initialLogs,
+  initialServices,
+  type Activity,
+  type Service,
+  type ServiceKind,
+  type ServiceState,
+  utilization,
+} from "@/lib/tmp-data";
+import { isOwnerSession, ownerEmail, supabase, supabaseConfigured } from "@/lib/supabase";
 
-/**
- * All content in this page are only for example, replace with your own feature implementation
- * When building pages, remember your instructions in Frontend Workflow, Frontend Best Practices, Design Guide and Common Pitfalls
- */
-export default function Home() {
-  // If theme is switchable in App.tsx, we can implement theme toggling like this:
-  // const { theme, toggleTheme } = useTheme();
+type NavKey = "overview" | "services" | "nodes" | "logs" | "alerts" | "settings";
 
-  return (
-    <div className="min-h-screen flex flex-col">
-      <main>
-        {/* Example: lucide-react for icons */}
-        <Loader2 className="animate-spin" />
-        Example Page
-        {/* Example: Streamdown for markdown rendering */}
-        <Streamdown>Any **markdown** content</Streamdown>
-        <Button variant="default">Example Button</Button>
-      </main>
-    </div>
-  );
+const navItems: { id: NavKey; label: string; icon: typeof LayoutDashboard; count?: string }[] = [
+  { id: "overview", label: "Overview", icon: LayoutDashboard },
+  { id: "services", label: "Services", icon: Boxes, count: "30" },
+  { id: "nodes", label: "Nodes", icon: Server, count: "01" },
+  { id: "logs", label: "Logs", icon: FileClock },
+  { id: "alerts", label: "Alerts", icon: TriangleAlert, count: "02" },
+];
+
+function Logo() {
+  return <div className="brand"><span className="brand-mark"><span /></span><span><strong>TMP</strong><em>SERVER</em></span></div>;
 }
+
+function StatusDot({ state }: { state: ServiceState }) {
+  return <span className={`status-dot ${state}`} aria-label={state} />;
+}
+
+function StateBadge({ state }: { state: ServiceState }) {
+  const labels: Record<ServiceState, string> = { running: "Running", stopped: "Stopped", degraded: "Degraded", restarting: "Restarting" };
+  return <span className={`state-badge ${state}`}><StatusDot state={state} />{labels[state]}</span>;
+}
+
+function MetricCard({ label, value, suffix, detail, tone = "blue", icon: Icon, children }: { label: string; value: string; suffix?: string; detail: string; tone?: string; icon: typeof Cpu; children?: React.ReactNode }) {
+  return <div className="metric-card">
+    <div className="metric-head"><span>{label}</span><span className={`metric-icon ${tone}`}><Icon size={15} /></span></div>
+    <div className="metric-value">{value}<small>{suffix}</small></div>
+    <div className="metric-detail">{detail}</div>
+    {children}
+  </div>;
+}
+
+function TinySparkline({ color = "#39d9ff", points = utilization }: { color?: string; points?: number[] }) {
+  const path = points.map((value, index) => `${index === 0 ? "M" : "L"} ${index * 8} ${38 - value * 0.32}`).join(" ");
+  return <svg className="sparkline" viewBox="0 0 184 44" preserveAspectRatio="none" aria-hidden="true"><path d={`${path} L 184 44 L 0 44 Z`} fill={`${color}12`} /><path d={path} fill="none" stroke={color} strokeWidth="1.7" /></svg>;
+}
+
+function ServiceIcon({ kind }: { kind: ServiceKind }) {
+  const Icon = kind === "Minecraft" ? Box : kind === "Database" ? Database : kind === "Proxy" ? Network : kind === "Web app" ? CloudCog : Archive;
+  return <span className="service-icon"><Icon size={16} /></span>;
+}
+
+function ConfigGate() {
+  return <div className="gate-wrap"><div className="gate-card">
+    <div className="gate-mark"><LockKeyhole size={26} /></div>
+    <p className="eyebrow">TMP SERVER / SETUP REQUIRED</p>
+    <h1>Connect your private control plane.</h1>
+    <p className="gate-copy">Supabase credentials are not configured in this environment. TMP Server stays locked rather than creating a fake session or exposing service controls.</p>
+    <div className="config-list">
+      <div><code>VITE_SUPABASE_URL</code><span>Project URL</span></div>
+      <div><code>VITE_SUPABASE_ANON_KEY</code><span>Browser-safe anon key</span></div>
+      <div><code>VITE_SUPABASE_OWNER_EMAIL</code><span>Single owner allowlist</span></div>
+    </div>
+    <div className="gate-foot"><ShieldCheck size={15} /> No public registration · owner allowlist required</div>
+  </div></div>;
+}
+
+function LoginGate({ session, onRefresh }: { session: Session | null; onRefresh: () => void }) {
+  const [email, setEmail] = useState(ownerEmail);
+  const [sent, setSent] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const denied = Boolean(session && !isOwnerSession(session));
+
+  async function sendMagicLink(event: React.FormEvent) {
+    event.preventDefault();
+    if (!supabase || !email) return;
+    setBusy(true); setError("");
+    const result = await supabase.auth.signInWithOtp({ email, options: { shouldCreateUser: false } });
+    setBusy(false);
+    if (result.error) setError(result.error.message);
+    else setSent(true);
+  }
+
+  async function signOut() {
+    await supabase?.auth.signOut();
+    onRefresh();
+  }
+
+  return <div className="gate-wrap"><div className="gate-card login-card">
+    <div className="gate-mark"><LockKeyhole size={26} /></div>
+    <p className="eyebrow">TMP SERVER / OWNER ACCESS</p>
+    <h1>Private infrastructure, by design.</h1>
+    {denied ? <>
+      <p className="gate-copy danger-copy">This Supabase account is not on the TMP Server owner allowlist. The session has no access to the control plane.</p>
+      <button className="button secondary full" onClick={signOut}><LogOut size={15} /> Sign out and try another account</button>
+    </> : sent ? <>
+      <p className="gate-copy">Magic link sent. Confirm the owner email to continue. This console never exposes a public sign-up flow.</p>
+      <button className="button secondary full" onClick={() => setSent(false)}>Use a different email</button>
+    </> : <form onSubmit={sendMagicLink}>
+      <label className="field-label">Owner email</label>
+      <div className="input-row"><input type="email" value={email} onChange={event => setEmail(event.target.value)} placeholder="owner@example.com" required /><button className="button primary" disabled={busy}>{busy ? "Sending…" : "Send magic link"}<ArrowUpRight size={15} /></button></div>
+      {error && <p className="form-error">{error}</p>}
+      <p className="form-hint"><ShieldCheck size={14} /> Access is restricted to the configured owner email.</p>
+    </form>}
+  </div></div>;
+}
+
+function Home() {
+  const [session, setSession] = useState<Session | null>(null);
+  const [authReady, setAuthReady] = useState(!supabaseConfigured);
+  const [nav, setNav] = useState<NavKey>("overview");
+  const [services, setServices] = useState<Service[]>(initialServices);
+  const [activity, setActivity] = useState<Activity[]>(initialActivity);
+  const [selected, setSelected] = useState<Service | null>(initialServices[0]);
+  const [drawer, setDrawer] = useState<"service" | "add" | null>(null);
+  const [notice, setNotice] = useState("");
+  const [search, setSearch] = useState("");
+  const [logFilter, setLogFilter] = useState("all");
+  const [newService, setNewService] = useState({ name: "", kind: "Web app" as ServiceKind, port: "8088", domain: "" });
+
+  useEffect(() => {
+    if (!supabase) return;
+    supabase.auth.getSession().then(({ data }) => { setSession(data.session); setAuthReady(true); });
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, nextSession) => { setSession(nextSession); setAuthReady(true); });
+    return () => listener.subscription.unsubscribe();
+  }, []);
+
+  useEffect(() => { if (notice) { const timer = window.setTimeout(() => setNotice(""), 3400); return () => window.clearTimeout(timer); } }, [notice]);
+
+  const visibleServices = useMemo(() => services.filter(service => `${service.name} ${service.kind}`.toLowerCase().includes(search.toLowerCase())), [services, search]);
+  const running = services.filter(service => service.state === "running").length;
+  const degraded = services.filter(service => service.state === "degraded").length;
+
+  function operate(service: Service, operation: "start" | "stop" | "restart" | "update") {
+    if (operation !== "start" && !window.confirm(`${operation[0].toUpperCase()}${operation.slice(1)} ${service.name}?`)) return;
+    const nextState: ServiceState = operation === "stop" ? "stopped" : operation === "restart" || operation === "update" ? "restarting" : "running";
+    const tone: Activity["tone"] = operation === "stop" ? "warning" : operation === "update" ? "success" : "info";
+    setServices(current => current.map(item => item.id === service.id ? { ...item, state: nextState, restarts: operation === "restart" || operation === "update" ? item.restarts + 1 : item.restarts } : item));
+    const message = operation === "update" ? "update recorded · image pull + rolling restart pending host binding" : `${operation} recorded · production supervisor binding pending`;
+    setActivity(current => [{ id: Date.now(), time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }), service: service.name, message, tone }, ...current].slice(0, 6));
+    setNotice(`${operation[0].toUpperCase()}${operation.slice(1)} queued for ${service.name}`);
+    setSelected({ ...service, state: nextState, restarts: operation === "restart" || operation === "update" ? service.restarts + 1 : service.restarts });
+  }
+
+  function addService(event: React.FormEvent) {
+    event.preventDefault();
+    if (!newService.name.trim()) return;
+    const normalizedId = newService.name.trim().toLowerCase().replace(/[^a-z0-9-]/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
+    const normalizedDomain = newService.domain.trim().toLowerCase();
+    if (!normalizedId || services.some(item => item.id === normalizedId)) { setNotice("A service with that name already exists"); return; }
+    if (normalizedDomain && !/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i.test(normalizedDomain)) { setNotice("Enter a valid hostname, for example app.example.com"); return; }
+    const service: Service = { id: normalizedId, name: newService.name.trim(), kind: newService.kind, state: "stopped", health: 0, cpu: 0, memory: 0, memoryLimit: 1024, port: Number(newService.port) || 8088, domain: normalizedDomain || undefined, uptime: "—", restarts: 0, boot: false, checkEvery: "30 sec", restartPolicy: "on-failure · 5 / 10m", dependencies: [], accent: "blue", description: "New service · awaiting host binding" };
+    setServices(current => [...current, service]);
+    setActivity(current => [{ id: Date.now(), time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }), service: service.name, message: "registry entry created · host binding pending", tone: "info" }, ...current]);
+    setNewService({ name: "", kind: "Web app", port: "8088", domain: "" }); setDrawer(null); setNotice(`${service.name} added to registry`);
+  }
+
+  if (!authReady) return <div className="loading-screen"><div className="loading-orbit" /><span>Checking owner session…</span></div>;
+  if (!supabaseConfigured) return <ConfigGate />;
+  if (!session || !isOwnerSession(session)) return <LoginGate session={session} onRefresh={() => setSession(null)} />;
+
+  return <div className="app-shell">
+    <aside className="sidebar">
+      <div className="sidebar-top"><Logo /><button className="mobile-menu"><Menu size={18} /></button></div>
+      <div className="node-switcher"><span className="node-pulse" /><span><b>tmp-node-01</b><small>standalone · primary</small></span><ChevronDown size={14} /></div>
+      <nav className="nav-group">
+        <p className="nav-caption">CONTROL PLANE</p>
+        {navItems.map(item => <button key={item.id} className={`nav-item ${nav === item.id ? "active" : ""}`} onClick={() => setNav(item.id)}><item.icon size={16} /><span>{item.label}</span>{item.count && <b>{item.count}</b>}</button>)}
+      </nav>
+      <div className="sidebar-tree"><p className="nav-caption">FLEET</p><div className="tree-line"><ChevronDown size={13} /><Server size={14} /><span>tmp-node-01</span><span className="tree-live">online</span></div><div className="tree-children"><div><StatusDot state="running" /> core services <b>04</b></div><div><StatusDot state="running" /> apps <b>17</b></div><div><StatusDot state="degraded" /> attention <b>02</b></div></div></div>
+      <div className="sidebar-bottom"><button className="nav-item"><Settings2 size={16} /><span>Settings</span></button><div className="owner-chip"><div className="avatar">{(session.user.email?.[0] ?? "O").toUpperCase()}</div><span><b>{session.user.email?.split("@")[0] ?? "owner"}</b><small>owner / online</small></span><MoreHorizontal size={16} /></div></div>
+    </aside>
+    <main className="main-content">
+      <header className="topbar"><div className="breadcrumbs"><span>Cluster</span><ChevronRight size={14} /><b>tmp-node-01</b><span className="slash">/</span><strong>{nav === "overview" ? "Overview" : nav[0].toUpperCase() + nav.slice(1)}</strong></div><div className="top-actions"><div className="heartbeat"><span className="heartbeat-dot" /> preview · fixture telemetry</div><button className="icon-button" title="Help"><CircleHelp size={17} /></button><button className="icon-button" title="Sign out" onClick={() => supabase?.auth.signOut()}><LogOut size={17} /></button></div></header>
+      <div className="content-scroll"><section className="page-heading"><div><p className="eyebrow">CONTROL PLANE / PRIVATE HOST</p><h1>{nav === "overview" ? "Overview" : nav === "services" ? "Services" : nav === "logs" ? "Log stream" : nav === "alerts" ? "Owner alerts" : "Node telemetry"}</h1><p className="page-subtitle">Host state, without the guesswork. Fixture sample · <span>21:52:08 UTC</span></p></div><div className="heading-actions"><button className="button secondary"><RefreshCw size={15} /> Refresh</button><button className="button primary" onClick={() => setDrawer("add")}><Plus size={16} /> Add service</button></div></section>
+        <div className="security-strip"><ShieldCheck size={15} /><span><b>Owner access active</b> · Supabase session verified against the configured allowlist</span><span className="strip-end">host operation bridge pending · no browser shell access</span></div>
+        <section className="metric-grid"><MetricCard label="FLEET HEALTH" value={`${running + 20}`} suffix=" / 30" detail={`${degraded + 1} service needs attention`} tone="cyan" icon={ActivityIcon}><TinySparkline /></MetricCard><MetricCard label="CPU UTILIZATION" value="42" suffix="%" detail="8 cores · 3.4 GHz avg" icon={Cpu}><TinySparkline color="#6e91ff" points={[32, 34, 35, 41, 38, 43, 40, 47, 42, 45, 43, 41, 44, 42]} /></MetricCard><MetricCard label="MEMORY" value="11.8" suffix=" / 32 GB" detail="36.9% allocated" tone="violet" icon={MemoryStick}><div className="meter"><span style={{ width: "37%" }} /></div></MetricCard><MetricCard label="STORAGE" value="72" suffix="%" detail="1.4 TB NVMe · 408 GB free" tone="amber" icon={HardDrive}><div className="meter amber"><span style={{ width: "72%" }} /></div></MetricCard></section>
+        <section className="main-grid"><div className="panel service-panel"><div className="panel-header"><div><p className="eyebrow">SERVICE REGISTRY</p><h2>Running services <span>{visibleServices.length} visible</span></h2></div><div className="panel-tools"><div className="search-input"><Search size={14} /><input value={search} onChange={event => setSearch(event.target.value)} placeholder="Filter services" /></div><button className="icon-button"><Filter size={16} /></button><button className="icon-button"><MoreHorizontal size={16} /></button></div></div><div className="table-wrap"><table><thead><tr><th>SERVICE</th><th>STATE</th><th>HEALTH</th><th>CPU</th><th>MEMORY</th><th>UPTIME</th><th /></tr></thead><tbody>{visibleServices.map(service => <tr key={service.id} className={selected?.id === service.id ? "selected-row" : ""} onClick={() => { setSelected(service); setDrawer("service"); }}><td><div className="service-name"><ServiceIcon kind={service.kind} /><span><b>{service.name}</b><small>{service.domain ? `${service.domain} · ` : ""}{service.description}</small></span></div></td><td><StateBadge state={service.state} /></td><td><div className="health-cell"><span className="health-bar"><i className={service.health < 80 ? "warning" : ""} style={{ width: `${service.health}%` }} /></span><small>{service.health}%</small></div></td><td className="mono">{service.cpu}%</td><td><div className="memory-cell"><span>{service.memory}%</span><span className="memory-bar"><i style={{ width: `${service.memory}%` }} /></span></div></td><td className="mono muted">{service.uptime}</td><td><button className="row-menu" onClick={event => { event.stopPropagation(); setSelected(service); setDrawer("service"); }}><MoreHorizontal size={16} /></button></td></tr>)}</tbody></table></div><div className="panel-footer"><span><span className="green-dot" /> {running + 20} running</span><span><span className="amber-dot" /> {degraded + 1} attention</span><button className="text-button" onClick={() => setNav("services")}>Open full registry <ArrowUpRight size={14} /></button></div></div>
+          <div className="side-stack"><div className="panel node-panel"><div className="panel-header compact"><div><p className="eyebrow">NODE TELEMETRY</p><h2>tmp-node-01</h2></div><span className="online-pill"><span /> sample data</span></div><div className="node-meta"><span><HardDrive size={14} /> Ubuntu 24.04 LTS</span><span><Network size={14} /> 10.0.0.12 · private</span></div><div className="util-chart"><div className="chart-axis"><span>80%</span><span>40%</span><span>0%</span></div><TinySparkline color="#39d9ff" /><div className="chart-labels"><span>12h ago</span><span>6h ago</span><span>now</span></div></div><div className="node-stat-row"><div><span>LOAD</span><b>2.86</b><small>8 vCPU</small></div><div><span>NETWORK</span><b>18.4</b><small>MB/s in</small></div><div><span>DISK I/O</span><b>4.2</b><small>MB/s avg</small></div></div></div><div className="panel alert-panel"><div className="panel-header compact"><div><p className="eyebrow">OWNER ALERTS</p><h2>Attention queue <span className="count-badge">02</span></h2></div><button className="icon-button" onClick={() => setNav("alerts")}><ArrowUpRight size={16} /></button></div><div className="alert-item"><span className="alert-icon warning"><AlertTriangle size={15} /></span><div><b>paperless-ngx</b><p>Health check latency above threshold</p><small>4 min ago · notify owner</small></div></div><div className="alert-item"><span className="alert-icon danger"><Zap size={15} /></span><div><b>tmp-node-01</b><p>Disk usage reached 72%</p><small>23 min ago · threshold 70%</small></div></div><div className="panel-footer"><button className="text-button" onClick={() => setNav("alerts")}>View alert history <ArrowUpRight size={14} /></button></div></div></div></section>
+        <section className="bottom-grid"><div className="panel activity-panel"><div className="panel-header compact"><div><p className="eyebrow">EVENT STREAM</p><h2>Recent operations</h2></div><button className="icon-button"><MoreHorizontal size={16} /></button></div><div className="activity-list">{activity.slice(0, 5).map(item => <div className="activity-item" key={item.id}><span className={`activity-marker ${item.tone}`} /><span className="activity-time">{item.time}</span><span className="activity-service">{item.service}</span><span className="activity-message">{item.message}</span></div>)}</div></div><div className="panel log-panel"><div className="panel-header compact"><div><p className="eyebrow">LOG STREAM</p><h2>Latest output</h2></div><div className="log-controls"><select value={logFilter} onChange={event => setLogFilter(event.target.value)}><option value="all">All services</option><option value="paperless-ngx">paperless-ngx</option><option value="minecraft-survival">minecraft-survival</option></select><TerminalSquare size={15} /></div></div><div className="log-list">{initialLogs.filter(log => logFilter === "all" || log.service === logFilter).map(log => <div className="log-line" key={`${log.time}-${log.service}`}><span>{log.time}</span><b className={log.level === "WARN" ? "warn" : "info"}>{log.level}</b><strong>{log.service}</strong><p>{log.message}</p></div>)}</div></div></section>
+      </div>
+    </main>
+    {drawer && <div className="drawer-backdrop" onClick={() => setDrawer(null)}><aside className="drawer" onClick={event => event.stopPropagation()}>{drawer === "service" && selected ? <><div className="drawer-head"><div><p className="eyebrow">SERVICE INSPECTOR</p><h2>{selected.name}</h2></div><button className="icon-button" onClick={() => setDrawer(null)}><X size={18} /></button></div><div className="drawer-status"><ServiceIcon kind={selected.kind} /><div><StateBadge state={selected.state} /><p>{selected.description}</p></div></div><div className="drawer-actions"><button className="button primary" onClick={() => operate(selected, "start")}><Play size={14} /> Start</button><button className="button secondary" onClick={() => operate(selected, "restart")}><RefreshCw size={14} /> Restart</button><button className="button secondary" onClick={() => operate(selected, "update")}><CloudCog size={14} /> Update</button><button className="button danger-button" onClick={() => operate(selected, "stop")}><Square size={13} /> Stop</button></div><div className="detail-section"><p className="eyebrow">RUNTIME</p><div className="detail-grid"><div><span>PORT</span><b>{selected.port}</b></div><div><span>UPTIME</span><b>{selected.uptime}</b></div><div><span>RESTARTS</span><b>{selected.restarts}</b></div><div><span>HEALTH</span><b>{selected.health}%</b></div></div></div><div className="detail-section"><p className="eyebrow">DOMAIN ROUTE</p><div className="route-row"><div><span>HOSTNAME</span><b>{selected.domain ?? "not linked"}</b></div>{selected.domain && <a href={`https://${selected.domain}`} target="_blank" rel="noreferrer"><ArrowUpRight size={15} /> Open</a>}</div><p className="route-help">Production TLS and reverse-proxy binding are pending host supervisor setup.</p></div><div className="detail-section"><p className="eyebrow">RECOVERY POLICY</p><div className="policy-row"><span>Boot startup</span><b>{selected.boot ? "enabled" : "disabled"}</b></div><div className="policy-row"><span>Health check</span><b>{selected.checkEvery}</b></div><div className="policy-row"><span>Restart policy</span><b>{selected.restartPolicy}</b></div><div className="policy-row"><span>Dependencies</span><b>{selected.dependencies.length ? selected.dependencies.join(", ") : "none"}</b></div></div><div className="drawer-note"><ShieldCheck size={15} /><span>Start, stop, restart, and update actions are recorded in the preview registry. Bind them to a server-side allowlisted supervisor before enabling production host mutations; direct host commands never reach the browser.</span></div></> : <><div className="drawer-head"><div><p className="eyebrow">SERVICE REGISTRY</p><h2>Add service</h2></div><button className="icon-button" onClick={() => setDrawer(null)}><X size={18} /></button></div><form className="add-form" onSubmit={addService}><label className="field-label">Service name<input value={newService.name} onChange={event => setNewService({ ...newService, name: event.target.value })} placeholder="my-service" required /></label><label className="field-label">Service type<select value={newService.kind} onChange={event => setNewService({ ...newService, kind: event.target.value as ServiceKind })}><option>Web app</option><option>Container</option><option>Database</option><option>Proxy</option><option>Minecraft</option></select></label><label className="field-label">Internal port<input type="number" min="1" max="65535" value={newService.port} onChange={event => setNewService({ ...newService, port: event.target.value })} /></label><label className="field-label">Domain route <span className="field-help">Optional hostname</span><input value={newService.domain} onChange={event => setNewService({ ...newService, domain: event.target.value })} placeholder="service.example.com" /></label><div className="add-policy"><div><b>Safe defaults applied</b><span>boot startup off · on-failure recovery · 30s health checks</span></div><ShieldCheck size={17} /></div><button className="button primary full" type="submit"><Plus size={15} /> Add to registry</button></form></>}</aside></div>}
+    {notice && <div className="toast"><ShieldCheck size={15} /><span>{notice}</span></div>}
+  </div>;
+}
+
+export default Home;

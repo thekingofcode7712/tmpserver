@@ -6,6 +6,9 @@ export const ENV = {
   get oAuthServerUrl() { return process.env.MANUS_OAUTH_API_URL ?? ""; },
   // Preserve the legacy hint when supplied; otherwise roles remain application data.
   get ownerOpenId() { return process.env.OWNER_OPEN_ID ?? ""; },
+  get supabaseJwtSecret() { return process.env.SUPABASE_JWT_SECRET ?? ""; },
+  get supabaseOwnerEmail() { return process.env.SUPABASE_OWNER_EMAIL ?? ""; },
+  get supabaseOwnerId() { return process.env.SUPABASE_OWNER_ID ?? ""; },
   get isProduction() { return process.env.NODE_ENV === "production"; },
   get forgeApiUrl() { return process.env.MANUS_API_URL ?? ""; },
   get forgeApiKey() { return process.env.MANUS_API_KEY ?? ""; },
