@@ -7,8 +7,11 @@ export const ENV = {
   // Preserve the legacy hint when supplied; otherwise roles remain application data.
   get ownerOpenId() { return process.env.OWNER_OPEN_ID ?? ""; },
   get supabaseJwtSecret() { return process.env.SUPABASE_JWT_SECRET ?? ""; },
-  get supabaseOwnerEmail() { return process.env.SUPABASE_OWNER_EMAIL ?? ""; },
+  get supabaseOwnerEmail() { return process.env.SUPABASE_OWNER_EMAIL ?? process.env.VITE_SUPABASE_OWNER_EMAIL ?? ""; },
   get supabaseOwnerId() { return process.env.SUPABASE_OWNER_ID ?? ""; },
+  get supabaseUrl() { return process.env.VITE_SUPABASE_URL ?? ""; },
+  get supabaseAnonKey() { return process.env.VITE_SUPABASE_ANON_KEY ?? ""; },
+  get supabaseServiceRoleKey() { return process.env.SUPABASE_SERVICE_ROLE_KEY ?? ""; },
   get isProduction() { return process.env.NODE_ENV === "production"; },
   get forgeApiUrl() { return process.env.MANUS_API_URL ?? ""; },
   get forgeApiKey() { return process.env.MANUS_API_KEY ?? ""; },

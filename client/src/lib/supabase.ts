@@ -16,3 +16,11 @@ export const supabase = supabaseConfigured ? createClient(url!, anonKey!, {
 export function isOwnerSession(session: Session | null) {
   return Boolean(session?.user.email && ownerEmail && session.user.email.toLowerCase() === ownerEmail);
 }
+
+export function isAllowedSession(session: Session | null) {
+  return isOwnerSession(session) || session?.user.app_metadata?.tmpserver_access === true;
+}
+
+export function sessionLabel(session: Session | null) {
+  return isOwnerSession(session) ? "owner" : "invited member";
+}

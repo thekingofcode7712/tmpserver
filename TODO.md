@@ -47,3 +47,8 @@
 - [x] Label fixture telemetry and pending host bindings explicitly in the preview.
 - [x] Confirm stop, restart, and update actions before recording them in the preview registry.
 - [x] Normalize and validate service IDs/hostnames and reject duplicate service IDs in the add-service flow.
+
+## Member invitations
+- [x] Allow the owner to invite additional users by email through Supabase without enabling public registration.
+- [x] Keep the Supabase service-role key server-side and protect the invite endpoint with the owner session.
+- [ ] Apply the same Supabase member authorization to every future host-control and data procedure on the server.

@@ -60,3 +60,7 @@ Each service carries an optional hostname route, shown in the registry and inspe
 
 
 The registry includes a first-class `Web app` kind with port, HTTPS hostname, health interval, restart policy, and dependency metadata, alongside container, proxy, database, and Minecraft services.
+
+
+## Member invitations
+The owner can invite additional operators by email from the dashboard. The server uses the Supabase admin invite API with the service-role key held only in project secrets, tags invited accounts with TMP Server member access, and keeps public registration disabled. The browser accepts only the configured owner or an invited account with the TMP Server access claim.

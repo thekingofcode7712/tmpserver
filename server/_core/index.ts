@@ -4,9 +4,11 @@ import { createServer } from "http";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
 import { registerOAuthRoutes } from "./oauth";
 import { publicPlatformScript } from "./publicConfig";
+import { getSupabaseUserFromRequest, inviteSupabaseMember, isSupabaseOwner } from "./supabase";
 import { appRouter } from "../routers";
 import { createContext } from "./context";
 import { serveStatic, setupVite } from "./vite";
+import { z } from "zod";
 
 async function startServer() {
   const app = express();
@@ -15,6 +17,27 @@ async function startServer() {
   app.use(express.json({ limit: "50mb" }));
   app.use(express.urlencoded({ limit: "50mb", extended: true }));
   app.get("/api/health", (_req, res) => res.json({ status: "ok" }));
+  app.post("/api/owner/invite", async (req, res) => {
+    const user = await getSupabaseUserFromRequest(req);
+    if (!user || !isSupabaseOwner(user)) {
+      res.status(403).json({ error: "Only the configured TMP Server owner can invite members." });
+      return;
+    }
+
+    const parsed = z.object({ email: z.string().email().max(320) }).safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "Enter a valid invite email." });
+      return;
+    }
+
+    try {
+      const invited = await inviteSupabaseMember(parsed.data.email.toLowerCase());
+      res.json({ ok: true, invited });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Invite failed.";
+      res.status(503).json({ error: message });
+    }
+  });
   app.get("/api/platform/config.js", (_req, res) => {
     res.set("Cache-Control", "no-store").type("application/javascript").send(publicPlatformScript());
   });
