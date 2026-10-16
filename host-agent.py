@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 import json
+import cgi
+import io
+import mimetypes
 import os
 import re
 import shlex
@@ -7,6 +10,7 @@ import shutil
 import subprocess
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -16,10 +20,14 @@ SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_ANON_KEY = os.environ["SUPABASE_ANON_KEY"]
 OWNER_EMAIL = os.environ.get("OWNER_EMAIL", "").strip().lower()
 ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "https://thekingofcode7712.github.io")
+PUBLIC_HOSTNAME = os.environ.get("PUBLIC_HOSTNAME", "140.238.70.11")
 STARTED = time.time()
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_\.]{3,16}$")
 CONSOLE_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,240}$")
 COMPOSE_FILE = "/opt/tmpserver/minecraft/compose.yml"
+CLOUD_ROOT = "/opt/tmpserver/cloud"
+MAX_UPLOAD = 50 * 1024 * 1024
+os.makedirs(CLOUD_ROOT, exist_ok=True)
 
 
 def json_bytes(value):
@@ -79,9 +87,28 @@ def host_state():
         "host": {"hostname": os.uname().nodename, "os": "Ubuntu 24.04", "architecture": os.uname().machine, "uptimeSeconds": round(uptime), "agentUptimeSeconds": round(time.time() - STARTED)},
         "memory": {"totalBytes": total, "availableBytes": available, "usedPercent": round((total - available) / total * 100, 1) if total else 0},
         "disk": {"totalBytes": disk.total, "freeBytes": disk.free, "usedPercent": round((disk.total - disk.free) / disk.total * 100, 1) if disk.total else 0},
-        "minecraft": {"container": "tmpserver-minecraft", "health": health, "portJava": 25565, "portBedrock": 19132, "onlinePlayers": online_players, "maxPlayers": max_players},
+        "minecraft": {"container": "tmpserver-minecraft", "health": health, "portJava": 25565, "portBedrock": 19132, "onlinePlayers": online_players, "maxPlayers": max_players, "publicHostname": PUBLIC_HOSTNAME},
         "services": services,
     }
+
+
+def safe_cloud_path(value):
+    candidate = os.path.normpath(str(value or "").strip().lstrip("/"))
+    if not candidate or candidate == "." or candidate.startswith("..") or "/../" in f"/{candidate}/" or "\\" in candidate:
+        return None
+    full = os.path.realpath(os.path.join(CLOUD_ROOT, candidate))
+    return full if full == CLOUD_ROOT or full.startswith(CLOUD_ROOT + os.sep) else None
+
+
+def cloud_files():
+    result = []
+    for root, _, names in os.walk(CLOUD_ROOT):
+        for name in names:
+            full = os.path.join(root, name)
+            relative = os.path.relpath(full, CLOUD_ROOT).replace(os.sep, "/")
+            stat = os.stat(full)
+            result.append({"path": relative, "name": name, "size": stat.st_size, "modified": int(stat.st_mtime)})
+    return sorted(result, key=lambda item: item["path"].lower())
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -102,12 +129,42 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_file(self, path):
+        size = os.path.getsize(path)
+        content_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(size))
+        self.send_header("Content-Disposition", f'attachment; filename="{os.path.basename(path)}"')
+        self.send_header("Access-Control-Allow-Origin", ALLOWED_ORIGIN)
+        self.send_header("Vary", "Origin")
+        self.end_headers()
+        with open(path, "rb") as file:
+            shutil.copyfileobj(file, self.wfile)
+
     def do_OPTIONS(self):
         self.send_json(204, {})
 
     def do_GET(self):
         if self.path == "/api/health":
             self.send_json(200, {"ok": True, "service": "tmpserver-host-agent", "state": host_state()})
+            return
+        if self.path == "/api/cloud/files":
+            if not auth_user(self):
+                self.send_json(401, {"error": "authenticated Supabase session required"})
+                return
+            self.send_json(200, {"files": cloud_files(), "usedBytes": sum(item["size"] for item in cloud_files())})
+            return
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/cloud/download":
+            if not auth_user(self):
+                self.send_json(401, {"error": "authenticated Supabase session required"})
+                return
+            path = safe_cloud_path(parse_qs(parsed.query).get("path", [""])[0])
+            if not path or not os.path.isfile(path):
+                self.send_json(404, {"error": "file not found"})
+                return
+            self.send_file(path)
             return
         if self.path == "/api/state":
             if not auth_user(self):
@@ -118,6 +175,41 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(404, {"error": "not found"})
 
     def do_POST(self):
+        if self.path in {"/api/cloud/upload", "/api/cloud/delete"}:
+            if not auth_user(self):
+                self.send_json(401, {"error": "owner or invited member session required"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length > MAX_UPLOAD:
+                    self.send_json(413, {"error": "file is larger than the 50 MB limit"})
+                    return
+                if self.path.endswith("/upload"):
+                    content_type = self.headers.get("Content-Type", "")
+                    _, params = cgi.parse_header(content_type)
+                    body = self.rfile.read(length)
+                    form = cgi.FieldStorage(fp=io.BytesIO(body), headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": content_type, "CONTENT_LENGTH": str(length)})
+                    item = form["file"] if "file" in form else None
+                    target = safe_cloud_path(form.getfirst("path", "") if "path" in form else (item.filename if item else ""))
+                    if not item or not target:
+                        self.send_json(400, {"error": "choose a file and a safe path"})
+                        return
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    with open(target, "wb") as file:
+                        shutil.copyfileobj(item.file, file)
+                    self.send_json(200, {"ok": True, "file": next(item for item in cloud_files() if os.path.realpath(os.path.join(CLOUD_ROOT, item["path"])) == target)})
+                    return
+                payload = json.loads(self.rfile.read(length))
+                target = safe_cloud_path(payload.get("path"))
+                if not target or not os.path.isfile(target):
+                    self.send_json(404, {"error": "file not found"})
+                    return
+                os.remove(target)
+                self.send_json(200, {"ok": True, "path": payload.get("path")})
+                return
+            except Exception as error:
+                self.send_json(400, {"error": f"cloud operation failed: {error}"})
+                return
         if self.path not in {"/api/minecraft/whitelist", "/api/minecraft/command", "/api/minecraft/lifecycle"}:
             self.send_json(404, {"error": "not found"})
             return

@@ -41,9 +41,11 @@ export type HostState = {
   host: { hostname: string; os: string; architecture: string; uptimeSeconds: number; agentUptimeSeconds: number };
   memory: { totalBytes: number; availableBytes: number; usedPercent: number };
   disk: { totalBytes: number; freeBytes: number; usedPercent: number };
-  minecraft: { container: string; health: string; portJava: number; portBedrock: number; onlinePlayers: number; maxPlayers: number };
+  minecraft: { container: string; health: string; portJava: number; portBedrock: number; onlinePlayers: number; maxPlayers: number; publicHostname: string };
   services: { name: string; status: string; ports: string }[];
 };
+
+export type CloudFile = { path: string; name: string; size: number; modified: number };
 
 // Live data is intentionally empty until a real supervisor agent is connected.
 // Never populate these arrays with representative values: the dashboard must not

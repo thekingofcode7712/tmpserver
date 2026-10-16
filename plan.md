@@ -1,10 +1,3 @@
 
-
-## Live-data boundary
-TMP Server must not render fixture services, telemetry, uptime, users, logs, alerts, or simulated lifecycle results. Until a real supervisor agent is connected through `VITE_HOST_API_URL`, the authenticated UI stops at an explicit no-live-host state. Real metrics and controls will be sourced from the persistent Linux host agent only.
-
-## Live VM supervisor bridge
-The GitHub Pages shell now polls a real host agent on the Ubuntu 24.04 VM for authenticated state and exposes a Minecraft Access drawer. The agent validates Supabase bearer sessions server-side, returns actual host memory/disk/container health, and executes only allowlisted Minecraft whitelist mutations through the Paper container. The current public transport is a temporary Cloudflare Quick Tunnel; a named Cloudflare Tunnel or user-owned DNS name should replace it for permanent operation because Quick Tunnel URLs can change after a VM restart.
-
-## Minecraft operations
-The Pages dashboard now exposes authenticated Start, Stop, Restart, Update, whitelist, and RCON console actions for the live Paper container. The host agent polls the real RCON `list` response and reports current online players versus max players; it does not use a stored user count.
+## VM Cloud storage and Minecraft connection details
+Cloud files are stored persistently on `/opt/tmpserver/cloud` and exposed through authenticated list, upload, download, and delete endpoints with a 50 MB per-file safety limit. The dashboard displays the real VM address `140.238.70.11` with Java port `25565` and Bedrock port `19132`. The previous 10-player cap was removed; the server now accepts up to 1000 configured players, which is the practical limit for this VM rather than an unsafe claim of infinite capacity.
