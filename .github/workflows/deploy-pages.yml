@@ -38,6 +38,7 @@ jobs:
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
           VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
           VITE_SUPABASE_OWNER_EMAIL: ${{ secrets.VITE_SUPABASE_OWNER_EMAIL }}
+          VITE_HOST_API_URL: https://harbour-sensitivity-wedding-recruitment.trycloudflare.com
         run: pnpm build:static
       - name: Configure Pages
         uses: actions/configure-pages@v5
