@@ -64,3 +64,7 @@ The registry includes a first-class `Web app` kind with port, HTTPS hostname, he
 
 ## Member invitations
 The owner can invite additional operators by email from the dashboard. The server uses the Supabase admin invite API with the service-role key held only in project secrets, tags invited accounts with TMP Server member access, and keeps public registration disabled. The browser accepts only the configured owner or an invited account with the TMP Server access claim.
+
+
+## Email OTP authentication
+Owner and invited members receive a six-digit Supabase email verification code and enter it in TMP Server. The UI no longer describes or depends on a magic-link redirect, and public registration remains disabled.

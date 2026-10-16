@@ -109,7 +109,8 @@ function ConfigGate() {
 
 function LoginGate({ session, onRefresh }: { session: Session | null; onRefresh: () => void }) {
   const [email, setEmail] = useState(ownerEmail);
-  const [sent, setSent] = useState(false);
+  const [otpSent, setOtpSent] = useState(false);
+  const [otp, setOtp] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const denied = Boolean(session && !isOwnerSession(session));
@@ -118,10 +119,20 @@ function LoginGate({ session, onRefresh }: { session: Session | null; onRefresh:
     event.preventDefault();
     if (!supabase || !email) return;
     setBusy(true); setError("");
-    const result = await supabase.auth.signInWithOtp({ email, options: { shouldCreateUser: false } });
+    const result = await supabase.auth.signInWithOtp({ email, options: { shouldCreateUser: false, emailRedirectTo: undefined } });
     setBusy(false);
     if (result.error) setError(result.error.message);
-    else setSent(true);
+    else setOtpSent(true);
+  }
+
+  async function verifyOtp(event: React.FormEvent) {
+    event.preventDefault();
+    if (!supabase || !email || otp.trim().length < 6) return;
+    setBusy(true); setError("");
+    const result = await supabase.auth.verifyOtp({ email, token: otp.trim(), type: "email" });
+    setBusy(false);
+    if (result.error) setError(result.error.message);
+    else onRefresh();
   }
 
   async function signOut() {
@@ -136,12 +147,12 @@ function LoginGate({ session, onRefresh }: { session: Session | null; onRefresh:
     {denied ? <>
       <p className="gate-copy danger-copy">This Supabase account is not the TMP Server owner or an invited member. The session has no access to the control plane.</p>
       <button className="button secondary full" onClick={signOut}><LogOut size={15} /> Sign out and try another account</button>
-    </> : sent ? <>
-      <p className="gate-copy">Magic link sent. Confirm the owner email to continue. This console never exposes a public sign-up flow.</p>
-      <button className="button secondary full" onClick={() => setSent(false)}>Use a different email</button>
+    </> : otpSent ? <>
+      <p className="gate-copy">A six-digit verification code was sent to <b>{email}</b>. Enter it below to continue. This console never exposes a public sign-up flow.</p>
+      <form onSubmit={verifyOtp}><label className="field-label">Email verification code<input inputMode="numeric" autoComplete="one-time-code" value={otp} onChange={event => setOtp(event.target.value.replace(/\D/g, "").slice(0, 6))} placeholder="123456" required /></label>{error && <p className="form-error">{error}</p>}<button className="button primary full" disabled={busy}>{busy ? "Verifying…" : "Verify code"}<ShieldCheck size={15} /></button><button type="button" className="button secondary full otp-back" onClick={() => { setOtpSent(false); setOtp(""); setError(""); }}>Use a different email</button></form>
     </> : <form onSubmit={sendMagicLink}>
-      <label className="field-label">Owner email</label>
-      <div className="input-row"><input type="email" value={email} onChange={event => setEmail(event.target.value)} placeholder="owner@example.com" required /><button className="button primary" disabled={busy}>{busy ? "Sending…" : "Send magic link"}<ArrowUpRight size={15} /></button></div>
+      <label className="field-label">Owner or invited member email</label>
+      <div className="input-row"><input type="email" value={email} onChange={event => setEmail(event.target.value)} placeholder="owner@example.com" required /><button className="button primary" disabled={busy}>{busy ? "Sending code…" : "Send email code"}<ArrowUpRight size={15} /></button></div>
       {error && <p className="form-error">{error}</p>}
       <p className="form-hint"><ShieldCheck size={14} /> Access is restricted to the configured owner or an invited member account.</p>
     </form>}

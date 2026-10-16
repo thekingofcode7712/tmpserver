@@ -52,3 +52,6 @@
 - [x] Allow the owner to invite additional users by email through Supabase without enabling public registration.
 - [x] Keep the Supabase service-role key server-side and protect the invite endpoint with the owner session.
 - [ ] Apply the same Supabase member authorization to every future host-control and data procedure on the server.
+
+## Email OTP authentication
+- [x] Replace magic-link wording and flow with six-digit Supabase email OTP entry and verification for the owner and invited members.
