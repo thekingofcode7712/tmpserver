@@ -41,7 +41,7 @@ export type HostState = {
   host: { hostname: string; os: string; architecture: string; uptimeSeconds: number; agentUptimeSeconds: number };
   memory: { totalBytes: number; availableBytes: number; usedPercent: number };
   disk: { totalBytes: number; freeBytes: number; usedPercent: number };
-  minecraft: { container: string; health: string; portJava: number; portBedrock: number };
+  minecraft: { container: string; health: string; portJava: number; portBedrock: number; onlinePlayers: number; maxPlayers: number };
   services: { name: string; status: string; ports: string }[];
 };
 

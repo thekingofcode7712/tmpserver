@@ -5,3 +5,6 @@ TMP Server must not render fixture services, telemetry, uptime, users, logs, ale
 
 ## Live VM supervisor bridge
 The GitHub Pages shell now polls a real host agent on the Ubuntu 24.04 VM for authenticated state and exposes a Minecraft Access drawer. The agent validates Supabase bearer sessions server-side, returns actual host memory/disk/container health, and executes only allowlisted Minecraft whitelist mutations through the Paper container. The current public transport is a temporary Cloudflare Quick Tunnel; a named Cloudflare Tunnel or user-owned DNS name should replace it for permanent operation because Quick Tunnel URLs can change after a VM restart.
+
+## Minecraft operations
+The Pages dashboard now exposes authenticated Start, Stop, Restart, Update, whitelist, and RCON console actions for the live Paper container. The host agent polls the real RCON `list` response and reports current online players versus max players; it does not use a stored user count.

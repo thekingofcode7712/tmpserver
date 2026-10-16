@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import time
@@ -17,6 +18,8 @@ OWNER_EMAIL = os.environ.get("OWNER_EMAIL", "").strip().lower()
 ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "https://thekingofcode7712.github.io")
 STARTED = time.time()
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_\.]{3,16}$")
+CONSOLE_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,240}$")
+COMPOSE_FILE = "/opt/tmpserver/minecraft/compose.yml"
 
 
 def json_bytes(value):
@@ -62,6 +65,10 @@ def host_state():
     health_code, health, _ = run(["docker", "inspect", "--format", "{{.State.Health.Status}}", "tmpserver-minecraft"])
     if health_code != 0:
         health = "unknown"
+    list_code, list_output, _ = run(["docker", "exec", "tmpserver-minecraft", "rcon-cli", "list"])
+    player_match = re.search(r"There are\s+(\d+)\s+of a max of\s+(\d+)\s+players online", list_output, re.IGNORECASE)
+    online_players = int(player_match.group(1)) if player_match else 0
+    max_players = int(player_match.group(2)) if player_match else 0
     ps_code, ps_out, _ = run(["docker", "ps", "--format", "{{.Names}}|{{.Status}}|{{.Ports}}"])
     services = []
     if ps_code == 0:
@@ -72,7 +79,7 @@ def host_state():
         "host": {"hostname": os.uname().nodename, "os": "Ubuntu 24.04", "architecture": os.uname().machine, "uptimeSeconds": round(uptime), "agentUptimeSeconds": round(time.time() - STARTED)},
         "memory": {"totalBytes": total, "availableBytes": available, "usedPercent": round((total - available) / total * 100, 1) if total else 0},
         "disk": {"totalBytes": disk.total, "freeBytes": disk.free, "usedPercent": round((disk.total - disk.free) / disk.total * 100, 1) if disk.total else 0},
-        "minecraft": {"container": "tmpserver-minecraft", "health": health, "portJava": 25565, "portBedrock": 19132},
+        "minecraft": {"container": "tmpserver-minecraft", "health": health, "portJava": 25565, "portBedrock": 19132, "onlinePlayers": online_players, "maxPlayers": max_players},
         "services": services,
     }
 
@@ -111,7 +118,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(404, {"error": "not found"})
 
     def do_POST(self):
-        if self.path != "/api/minecraft/whitelist":
+        if self.path not in {"/api/minecraft/whitelist", "/api/minecraft/command", "/api/minecraft/lifecycle"}:
             self.send_json(404, {"error": "not found"})
             return
         if not auth_user(self):
@@ -122,20 +129,53 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(length))
             username = str(payload.get("username", "")).strip()
             action = str(payload.get("action", "add")).strip().lower()
+            command = str(payload.get("command", "")).strip()
         except (ValueError, json.JSONDecodeError):
             self.send_json(400, {"error": "invalid JSON"})
             return
-        if not USERNAME_RE.fullmatch(username):
-            self.send_json(400, {"error": "Minecraft username must be 3–16 letters, numbers, underscore, or dot"})
+        if self.path == "/api/minecraft/whitelist":
+            if not USERNAME_RE.fullmatch(username):
+                self.send_json(400, {"error": "Minecraft username must be 3–16 letters, numbers, underscore, or dot"})
+                return
+            if action not in {"add", "remove"}:
+                self.send_json(400, {"error": "action must be add or remove"})
+                return
+            command_args = ["whitelist", action, username]
+        elif self.path == "/api/minecraft/command":
+            if not CONSOLE_RE.fullmatch(command) or not command:
+                self.send_json(400, {"error": "Enter one Minecraft command under 240 characters"})
+                return
+            try:
+                command_args = shlex.split(command.lstrip("/"))
+            except ValueError:
+                self.send_json(400, {"error": "Invalid command quoting"})
+                return
+            if not command_args:
+                self.send_json(400, {"error": "Command cannot be empty"})
+                return
+        else:
+            lifecycle = action
+            if lifecycle not in {"start", "stop", "restart", "update"}:
+                self.send_json(400, {"error": "action must be start, stop, restart, or update"})
+                return
+            if lifecycle == "update":
+                code, stdout, stderr = run(["docker", "compose", "-f", COMPOSE_FILE, "pull", "minecraft"], timeout=180)
+                if code == 0:
+                    code, stdout2, stderr2 = run(["docker", "compose", "-f", COMPOSE_FILE, "up", "-d", "minecraft"], timeout=60)
+                    stdout = f"{stdout}\n{stdout2}"; stderr = f"{stderr}\n{stderr2}"
+            else:
+                compose_action = "up -d" if lifecycle == "start" else lifecycle
+                code, stdout, stderr = run(["docker", "compose", "-f", COMPOSE_FILE, *compose_action.split(), "minecraft"], timeout=45)
+            if code != 0:
+                self.send_json(502, {"error": "Minecraft lifecycle command failed", "detail": stderr[-300:]})
+                return
+            self.send_json(200, {"ok": True, "action": lifecycle, "state": host_state()})
             return
-        if action not in {"add", "remove"}:
-            self.send_json(400, {"error": "action must be add or remove"})
-            return
-        code, stdout, stderr = run(["docker", "exec", "tmpserver-minecraft", "rcon-cli", "whitelist", action, username])
+        code, stdout, stderr = run(["docker", "exec", "tmpserver-minecraft", "rcon-cli", *command_args])
         if code != 0:
             self.send_json(502, {"error": "Minecraft command failed", "detail": stderr[-300:]})
             return
-        self.send_json(200, {"ok": True, "action": action, "username": username, "output": stdout[-500:]})
+        self.send_json(200, {"ok": True, "action": action if self.path.endswith("whitelist") else "command", "username": username if self.path.endswith("whitelist") else None, "output": stdout[-1000:]})
 
 
 if __name__ == "__main__":
