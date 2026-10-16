@@ -51,6 +51,7 @@ import {
 import { isAllowedSession, isOwnerSession, ownerEmail, sessionLabel, supabase, supabaseConfigured } from "@/lib/supabase";
 
 const staticPages = import.meta.env.VITE_STATIC_ONLY === "true";
+const hostApiUrl = (import.meta.env.VITE_HOST_API_URL as string | undefined)?.trim() ?? "";
 
 type NavKey = "overview" | "services" | "nodes" | "logs" | "alerts" | "settings";
 
@@ -165,6 +166,21 @@ function LoginGate({ session, onRefresh }: { session: Session | null; onRefresh:
   </div></div>;
 }
 
+function HostUnavailable() {
+  return <div className="gate-wrap"><div className="gate-card login-card">
+    <div className="gate-mark"><Server size={26} /></div>
+    <p className="eyebrow">TMP SERVER / NO LIVE HOST</p>
+    <h1>Connect a real service host.</h1>
+    <p className="gate-copy">No supervisor agent is connected, so TMP Server is withholding service state, uptime, metrics, logs, user counts, and lifecycle controls. This screen will not show sample data.</p>
+    <div className="config-list">
+      <div><code>HOST AGENT</code><span>Not connected</span></div>
+      <div><code>LIVE METRICS</code><span>Unavailable</span></div>
+      <div><code>HOST CONTROLS</code><span>Disabled</span></div>
+    </div>
+    <div className="gate-foot"><ShieldCheck size={15} /> Connect a persistent Linux host with the TMP supervisor before enabling production controls.</div>
+  </div></div>;
+}
+
 function InvitePanel({ email, setEmail, busy, error, onClose, onSubmit }: { email: string; setEmail: (value: string) => void; busy: boolean; error: string; onClose: () => void; onSubmit: (event: React.FormEvent) => void }) {
   return <><div className="drawer-head"><div><p className="eyebrow">TEAM ACCESS</p><h2>Invite member</h2></div><button className="icon-button" onClick={onClose}><X size={18} /></button></div><form className="add-form" onSubmit={onSubmit}><div className="invite-hero"><span className="invite-icon"><Users size={20} /></span><p>Invite a trusted operator to TMP Server. Supabase sends the email and marks the account as an approved member; public registration stays disabled.</p></div><label className="field-label">Member email<input type="email" value={email} onChange={event => setEmail(event.target.value)} placeholder="operator@example.com" required /></label>{error && <p className="form-error">{error}</p>}<div className="add-policy"><div><b>Member access only</b><span>Invited users can sign in, inspect services, and use the control plane. The owner remains the only account allowed to send invites.</span></div><ShieldCheck size={17} /></div><button className="button primary full" type="submit" disabled={busy}><Users size={15} /> {busy ? "Sending invite…" : "Send Supabase invite"}</button></form></>;
 }
@@ -244,6 +260,7 @@ function Home() {
   if (!authReady) return <div className="loading-screen"><div className="loading-orbit" /><span>Checking owner session…</span></div>;
   if (!supabaseConfigured) return <ConfigGate />;
   if (!session || !isAllowedSession(session)) return <LoginGate session={session} onRefresh={() => setSession(null)} />;
+  if (!hostApiUrl) return <HostUnavailable />;
 
   return <div className="app-shell">
     <aside className="sidebar">
