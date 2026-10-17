@@ -25,6 +25,7 @@ STARTED = time.time()
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_\.]{3,16}$")
 CONSOLE_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,240}$")
 COMPOSE_FILE = "/opt/tmpserver/minecraft/compose.yml"
+BACKUP_SCRIPT = "/usr/local/bin/tmpserver-minecraft-backup"
 CLOUD_ROOT = "/opt/tmpserver/cloud"
 MAX_UPLOAD = 50 * 1024 * 1024
 os.makedirs(CLOUD_ROOT, exist_ok=True)
@@ -250,6 +251,11 @@ class Handler(BaseHTTPRequestHandler):
             if lifecycle not in {"start", "stop", "restart", "update"}:
                 self.send_json(400, {"error": "action must be start, stop, restart, or update"})
                 return
+            if lifecycle in {"stop", "restart", "update"}:
+                backup_code, backup_stdout, backup_stderr = run([BACKUP_SCRIPT], timeout=240)
+                if backup_code != 0:
+                    self.send_json(502, {"error": "Minecraft backup failed; lifecycle action was not run", "detail": backup_stderr[-300:] or backup_stdout[-300:]})
+                    return
             if lifecycle == "update":
                 code, stdout, stderr = run(["docker", "compose", "-f", COMPOSE_FILE, "pull", "minecraft"], timeout=180)
                 if code == 0:
