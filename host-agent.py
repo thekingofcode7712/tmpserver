@@ -19,7 +19,12 @@ PORT = int(os.environ.get("TMP_AGENT_PORT", "8787"))
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_ANON_KEY = os.environ["SUPABASE_ANON_KEY"]
 OWNER_EMAIL = os.environ.get("OWNER_EMAIL", "").strip().lower()
-ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "https://thekingofcode7712.github.io")
+ALLOWED_ORIGINS = {
+    origin.strip().rstrip("/")
+    for origin in os.environ.get("ALLOWED_ORIGIN", "https://thekingofcode7712.github.io").split(",")
+    if origin.strip()
+}
+ALLOWED_ORIGINS.update({"https://tmpserver.com", "https://www.tmpserver.com"})
 PUBLIC_HOSTNAME = os.environ.get("PUBLIC_HOSTNAME", "140.238.70.11")
 STARTED = time.time()
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_\.]{3,16}$")
@@ -123,7 +128,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", ALLOWED_ORIGIN)
+        self.send_header("Access-Control-Allow-Origin", self.cors_origin())
         self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Vary", "Origin")
@@ -137,11 +142,15 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(size))
         self.send_header("Content-Disposition", f'attachment; filename="{os.path.basename(path)}"')
-        self.send_header("Access-Control-Allow-Origin", ALLOWED_ORIGIN)
+        self.send_header("Access-Control-Allow-Origin", self.cors_origin())
         self.send_header("Vary", "Origin")
         self.end_headers()
         with open(path, "rb") as file:
             shutil.copyfileobj(file, self.wfile)
+
+    def cors_origin(self):
+        origin = self.headers.get("Origin", "").rstrip("/")
+        return origin if origin in ALLOWED_ORIGINS else "https://tmpserver.com"
 
     def do_OPTIONS(self):
         self.send_json(204, {})
