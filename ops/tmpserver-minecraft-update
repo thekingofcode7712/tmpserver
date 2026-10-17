@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT=/opt/tmpserver/minecraft
+DATA="$ROOT/data"
+LOCK=/run/lock/tmpserver-minecraft-update.lock
+mkdir -p "$(dirname "$LOCK")"
+exec 9>"$LOCK"
+flock -n 9 || exit 0
+cd "$ROOT"
+
+players="$(docker exec tmpserver-minecraft rcon-cli list 2>/dev/null || true)"
+if printf '%s' "$players" | grep -Eq 'There are [1-9][0-9]* of a max'; then
+  echo "Players are online; postponing automatic update until the next maintenance window."
+  exit 0
+fi
+
+/usr/local/bin/tmpserver-minecraft-backup
+
+# VERSION=LATEST makes the itzg image install the newest compatible stable Paper build on startup.
+docker compose pull minecraft
+curl -fsSL 'https://download.geysermc.org/v2/projects/geyser/versions/latest/builds/latest/downloads/spigot' -o /tmp/Geyser-Spigot.jar
+curl -fsSL 'https://download.geysermc.org/v2/projects/floodgate/versions/latest/builds/latest/downloads/spigot' -o /tmp/floodgate-spigot.jar
+install -m 0644 /tmp/Geyser-Spigot.jar "$DATA/plugins/Geyser-Spigot.jar"
+install -m 0644 /tmp/floodgate-spigot.jar "$DATA/plugins/floodgate-spigot.jar"
+rm -f /tmp/Geyser-Spigot.jar /tmp/floodgate-spigot.jar
+
+docker compose up -d --force-recreate minecraft
+for attempt in {1..30}; do
+  health="$(docker inspect --format '{{.State.Health.Status}}' tmpserver-minecraft 2>/dev/null || true)"
+  [ "$health" = healthy ] && { echo "Minecraft automatic update completed; server is healthy."; exit 0; }
+  sleep 10
+done
+
+echo "Minecraft did not become healthy after automatic update." >&2
+exit 1

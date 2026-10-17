@@ -1,0 +1,8 @@
+[Unit]
+Description=TMP Server Minecraft safe automatic updater
+After=docker.service tmpserver-minecraft-backup.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/tmpserver-minecraft-update

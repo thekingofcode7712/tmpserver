@@ -1,0 +1,11 @@
+[Unit]
+Description=Weekly TMP Server Minecraft update check
+
+[Timer]
+OnCalendar=Sun *-*-* 04:15:00 Europe/London
+Persistent=true
+RandomizedDelaySec=15m
+Unit=tmpserver-minecraft-update.service
+
+[Install]
+WantedBy=timers.target
