@@ -34,6 +34,7 @@ jobs:
       - name: Build static Pages frontend
         env:
           GITHUB_PAGES: "true"
+          VITE_PAGES_BASE: "/"
           VITE_STATIC_ONLY: "true"
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
           VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
