@@ -1,0 +1,5 @@
+name: TMPKeepInventory
+version: 1.0.0
+main: com.tmpserver.keepinv.KeepInventoryPlugin
+api-version: '1.21'
+description: Per-player keep inventory for the TMP Server owner.

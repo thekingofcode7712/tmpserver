@@ -160,6 +160,7 @@ table { width: 100%; border-collapse: collapse; min-width: 720px; } th { color: 
 
 .cloud-page { display: grid; gap: 16px; }
 .cloud-hero { display: flex; align-items: end; justify-content: space-between; gap: 24px; padding: 24px; background: linear-gradient(135deg, #122331, #101722); border: 1px solid var(--border); border-radius: 5px; }
+.cloud-hero-actions { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
 .cloud-hero h2 { margin: 0; color: #edf5ff; font-size: 25px; font-weight: 600; }
 .cloud-hero p:not(.eyebrow) { max-width: 680px; margin: 8px 0 0; color: #8799ae; font-size: 12px; line-height: 1.6; }
 .cloud-hero code { color: var(--cyan); font: 10px "IBM Plex Mono", monospace; }
@@ -178,4 +179,4 @@ table { width: 100%; border-collapse: collapse; min-width: 720px; } th { color: 
 .cloud-empty { display: grid; place-items: center; gap: 8px; min-height: 230px; color: #5e748c; }
 .cloud-empty svg { color: #396174; }
 .cloud-empty p { margin: 0; font-size: 12px; }
-@media (max-width: 680px) { .cloud-hero { align-items: stretch; flex-direction: column; padding: 18px; }.upload-button { width: 100%; }.cloud-row { grid-template-columns: minmax(0, 1fr) 72px 68px; padding: 0 10px; }.cloud-row > span:nth-child(3) { overflow: hidden; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }.cloud-actions { grid-column: 3; }.cloud-head .cloud-actions { display: none; }.cloud-head { grid-template-columns: minmax(0, 1fr) 72px 68px; }.cloud-stats { gap: 8px; }.cloud-stats > div { padding: 12px; }.cloud-stats b { font-size: 15px; } }
+@media (max-width: 680px) { .cloud-hero { align-items: stretch; flex-direction: column; padding: 18px; }.cloud-hero-actions { align-items: stretch; flex-direction: column; }.cloud-hero-actions .button { width: 100%; }.upload-button { width: 100%; }.cloud-row { grid-template-columns: minmax(0, 1fr) 72px 68px; padding: 0 10px; }.cloud-row > span:nth-child(3) { overflow: hidden; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }.cloud-actions { grid-column: 3; }.cloud-head .cloud-actions { display: none; }.cloud-head { grid-template-columns: minmax(0, 1fr) 72px 68px; }.cloud-stats { gap: 8px; }.cloud-stats > div { padding: 12px; }.cloud-stats b { font-size: 15px; } }

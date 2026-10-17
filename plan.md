@@ -4,3 +4,6 @@ Cloud files are stored persistently on `/opt/tmpserver/cloud` and exposed throug
 
 ## Rolling Minecraft backup
 The host creates `/opt/tmpserver/cloud/minecraft-latest.tar.gz` atomically after a Paper `save-all flush`. The same file is overwritten before controlled stop, restart, or update operations and by an enabled systemd shutdown target hook, so the Cloud section exposes one current backup rather than an unbounded archive list.
+
+## Owner-only Minecraft keep inventory and manual backups
+The live Paper server includes `TMPKeepInventory`, a small event plugin keyed to the owner's Floodgate UUID so only `.BroodyFoil99867` keeps inventory, levels, and experience after death. The Cloud section has an authenticated **Back up Minecraft** action that runs `save-all flush`, atomically overwrites `minecraft-latest.tar.gz`, and refreshes the file listing.

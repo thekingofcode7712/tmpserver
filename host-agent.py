@@ -211,7 +211,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as error:
                 self.send_json(400, {"error": f"cloud operation failed: {error}"})
                 return
-        if self.path not in {"/api/minecraft/whitelist", "/api/minecraft/command", "/api/minecraft/lifecycle"}:
+        if self.path not in {"/api/minecraft/whitelist", "/api/minecraft/command", "/api/minecraft/lifecycle", "/api/minecraft/backup"}:
             self.send_json(404, {"error": "not found"})
             return
         if not auth_user(self):
@@ -225,6 +225,13 @@ class Handler(BaseHTTPRequestHandler):
             command = str(payload.get("command", "")).strip()
         except (ValueError, json.JSONDecodeError):
             self.send_json(400, {"error": "invalid JSON"})
+            return
+        if self.path == "/api/minecraft/backup":
+            code, stdout, stderr = run([BACKUP_SCRIPT], timeout=240)
+            if code != 0:
+                self.send_json(502, {"error": "Minecraft backup failed", "detail": stderr[-300:] or stdout[-300:]})
+                return
+            self.send_json(200, {"ok": True, "action": "backup", "output": stdout[-1000:]})
             return
         if self.path == "/api/minecraft/whitelist":
             if not USERNAME_RE.fullmatch(username):
