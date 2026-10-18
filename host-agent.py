@@ -134,6 +134,8 @@ def host_state():
         for row in ps_out.splitlines():
             name, status, ports = (row.split("|", 2) + ["", ""])[:3]
             services.append({"name": name, "status": status, "ports": ports})
+    for site in read_websites():
+        services.append({"name": site["name"], "status": "running" if site.get("active") else "stopped", "ports": f"HTTPS · {site['domain']}", "kind": "Web app", "domain": site["domain"], "files": website_state(site)["files"], "bytes": website_state(site)["bytes"]})
     return {
         "host": {"hostname": os.uname().nodename, "os": "Ubuntu 24.04", "architecture": os.uname().machine, "uptimeSeconds": round(uptime), "agentUptimeSeconds": round(time.time() - STARTED)},
         "memory": {"totalBytes": total, "availableBytes": available, "usedPercent": round((total - available) / total * 100, 1) if total else 0},

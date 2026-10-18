@@ -43,7 +43,7 @@ export type HostState = {
   disk: { totalBytes: number; freeBytes: number; usedPercent: number };
   network: { interface: string; linkMbps: number; sampleSeconds: number; rxBytes: number; txBytes: number; rxBytesPerSecond: number; txBytesPerSecond: number; rxPacketsPerSecond: number; txPacketsPerSecond: number; rxDropped: number; txDropped: number };
   minecraft: { container: string; health: string; portJava: number; portBedrock: number; onlinePlayers: number; maxPlayers: number; publicHostname: string };
-  services: { name: string; status: string; ports: string }[];
+  services: { name: string; status: string; ports: string; kind?: ServiceKind; domain?: string; files?: number; bytes?: number }[];
 };
 
 export type CloudFile = { path: string; name: string; size: number; modified: number };

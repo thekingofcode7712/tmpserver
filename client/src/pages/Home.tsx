@@ -276,7 +276,8 @@ function Home() {
         if (active) {
           const state = payload as HostState;
           const minecraft: Service = { id: "minecraft", name: "Minecraft", kind: "Minecraft", state: state.minecraft.health === "healthy" ? "running" : "degraded", health: state.minecraft.health === "healthy" ? 100 : 0, cpu: -1, memory: -1, memoryLimit: 3072, port: state.minecraft.portJava, domain: undefined, uptime: formatUptime(state.host.uptimeSeconds), restarts: 0, boot: true, checkEvery: "live health", restartPolicy: "unless-stopped", dependencies: [], accent: "green", description: `Paper + Geyser · Java ${state.minecraft.portJava} · Bedrock ${state.minecraft.portBedrock}` };
-          setHostState(state); setServices([minecraft]); setSelected(minecraft); setHostError("");
+          const hostedServices: Service[] = state.services.filter(item => item.name !== "tmpserver-minecraft").map(item => ({ id: `website-${item.name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`, name: item.name, kind: item.kind ?? "Web app", state: item.status === "running" ? "running" : "stopped", health: item.status === "running" ? 100 : 0, cpu: -1, memory: -1, memoryLimit: 0, port: 443, domain: item.domain, uptime: "—", restarts: 0, boot: true, checkEvery: "Caddy route", restartPolicy: "always", dependencies: ["caddy"], accent: item.status === "running" ? "green" : "slate", description: item.domain ? `Static site · ${item.domain}` : "Managed website" }));
+          setHostState(state); setServices([minecraft, ...hostedServices]); setSelected(minecraft); setHostError("");
         }
       } catch (error) { if (active) setHostError(error instanceof Error ? error.message : "Unable to reach host agent."); }
     }
