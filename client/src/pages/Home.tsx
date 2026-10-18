@@ -72,6 +72,7 @@ const navItems: { id: NavKey; label: string; icon: typeof LayoutDashboard; count
   { id: "alerts", label: "Alerts", icon: TriangleAlert },
   { id: "websites", label: "Websites", icon: Globe },
   { id: "cloud", label: "Cloud", icon: Cloud },
+  { id: "settings", label: "Settings", icon: Settings2 },
 ];
 
 function Logo() {
