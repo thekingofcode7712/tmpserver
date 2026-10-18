@@ -17,6 +17,7 @@ import {
   Download,
   FileClock,
   Filter,
+  Globe,
   HardDrive,
   LayoutDashboard,
   LockKeyhole,
@@ -48,6 +49,7 @@ import {
   type Activity,
   type CloudFile,
   type HostState,
+  type Website,
   type Service,
   type ServiceKind,
   type ServiceState,
@@ -58,7 +60,7 @@ import { isAllowedSession, isOwnerSession, ownerEmail, sessionLabel, supabase, s
 const staticPages = import.meta.env.VITE_STATIC_ONLY === "true";
 const hostApiUrl = (import.meta.env.VITE_HOST_API_URL as string | undefined)?.trim() ?? "";
 
-type NavKey = "overview" | "services" | "nodes" | "logs" | "alerts" | "cloud" | "settings";
+type NavKey = "overview" | "services" | "nodes" | "logs" | "alerts" | "websites" | "cloud" | "settings";
 
 const navItems: { id: NavKey; label: string; icon: typeof LayoutDashboard; count?: string }[] = [
   { id: "overview", label: "Overview", icon: LayoutDashboard },
@@ -66,6 +68,7 @@ const navItems: { id: NavKey; label: string; icon: typeof LayoutDashboard; count
   { id: "nodes", label: "Nodes", icon: Server },
   { id: "logs", label: "Logs", icon: FileClock },
   { id: "alerts", label: "Alerts", icon: TriangleAlert },
+  { id: "websites", label: "Websites", icon: Globe },
   { id: "cloud", label: "Cloud", icon: Cloud },
 ];
 
@@ -209,6 +212,10 @@ function CloudPanel({ files, usedBytes, busy, error, onUpload, onBackup, onDownl
   return <section className="cloud-page"><div className="cloud-hero"><div><p className="eyebrow">PRIVATE VM STORAGE</p><h2>Cloud files</h2><p>Persistent files stored on the connected Ubuntu VM at <code>/opt/tmpserver/cloud</code>. Only authenticated TMP operators can access them.</p><p className="route-help"><strong>Minecraft backup:</strong> <code>minecraft-latest.tar.gz</code> is overwritten before controlled stop/restart/update actions and during VM shutdown.</p></div><div className="cloud-hero-actions"><button className="button secondary" onClick={onBackup} disabled={busy}><Archive size={15} /> {busy ? "Saving…" : "Back up Minecraft"}</button><label className="button primary upload-button"><Upload size={15} /> {busy ? "Uploading…" : "Upload file"}<input type="file" onChange={event => { const file = event.target.files?.[0]; if (file) onUpload(file); event.currentTarget.value = ""; }} disabled={busy} /></label></div></div>{error && <p className="form-error">{error}</p>}<div className="cloud-stats"><div><span>FILES</span><b>{files.length}</b></div><div><span>USED</span><b>{formatBytes(usedBytes)}</b></div><div><span>LIMIT / FILE</span><b>50 MB</b></div></div><div className="cloud-table"><div className="cloud-row cloud-head"><span>NAME</span><span>SIZE</span><span>MODIFIED</span><span /></div>{files.length ? files.map(file => <div className="cloud-row" key={file.path}><span className="cloud-name"><Archive size={15} />{file.path}</span><span>{formatBytes(file.size)}</span><span>{new Date(file.modified * 1000).toLocaleString()}</span><span className="cloud-actions"><button className="icon-button" title="Download" onClick={() => onDownload(file)}><Download size={15} /></button><button className="icon-button" title="Delete" onClick={() => onDelete(file)}><Trash2 size={15} /></button></span></div>) : <div className="cloud-empty"><Cloud size={22} /><p>No files stored yet. Upload your first file to the VM cloud.</p></div>}</div></section>;
 }
 
+function WebsitesPanel({ sites, busy, error, name, setName, domain, setDomain, onCreate, onDeploy, onLifecycle, onDelete }: { sites: Website[]; busy: boolean; error: string; name: string; setName: (value: string) => void; domain: string; setDomain: (value: string) => void; onCreate: (event: React.FormEvent) => void; onDeploy: (site: Website, file: File) => void; onLifecycle: (site: Website, action: "start" | "stop") => void; onDelete: (site: Website) => void }) {
+  return <section className="cloud-page"><div className="cloud-hero"><div><p className="eyebrow">STATIC WEBSITE HOSTING</p><h2>Websites</h2><p>Deploy static HTML/CSS/JS sites to the persistent Ubuntu VM. Caddy handles HTTPS and serves only authenticated operator-managed files.</p><p className="route-help"><strong>Safe scope:</strong> ZIP deployments must contain <code>index.html</code>. Node/PHP runtimes are not enabled by this panel yet.</p></div></div><form className="website-create" onSubmit={onCreate}><input value={name} onChange={event => setName(event.target.value)} placeholder="Site name" required /><input value={domain} onChange={event => setDomain(event.target.value)} placeholder="www.example.com" required /><button className="button primary" type="submit" disabled={busy}><Plus size={15} /> Create website</button></form>{error && <p className="form-error">{error}</p>}<div className="cloud-stats"><div><span>SITES</span><b>{sites.length}</b></div><div><span>ACTIVE</span><b>{sites.filter(site => site.active).length}</b></div><div><span>DEPLOYMENT</span><b>ZIP / 50 MB</b></div></div><div className="website-grid">{sites.length ? sites.map(site => <article className="website-card" key={site.slug}><div className="website-card-head"><div><p className="eyebrow">{site.active ? "ACTIVE" : "STOPPED"}</p><h3>{site.name}</h3></div><span className={`status-dot ${site.active ? "running" : "stopped"}`} /></div><p className="website-domain">{site.domain}</p><div className="website-meta"><span>{site.files} files</span><span>{formatBytes(site.bytes)}</span></div><div className="website-actions"><label className="button secondary upload-button"><Upload size={14} /> Deploy ZIP<input type="file" accept=".zip,application/zip" onChange={event => { const file = event.target.files?.[0]; if (file) onDeploy(site, file); event.currentTarget.value = ""; }} disabled={busy} /></label><button className="button secondary" onClick={() => onLifecycle(site, site.active ? "stop" : "start")} disabled={busy}>{site.active ? <Square size={14} /> : <Play size={14} />}{site.active ? "Stop" : "Start"}</button><button className="icon-button" title="Delete website" onClick={() => onDelete(site)} disabled={busy}><Trash2 size={15} /></button></div></article>) : <div className="cloud-empty"><Globe size={22} /><p>No websites yet. Create a site, point DNS at 140.238.70.11, then deploy a ZIP.</p></div>}</div></section>;
+}
+
 function MinecraftConsole({ command, setCommand, output, busy, error, onClose, onSubmit }: { command: string; setCommand: (value: string) => void; output: string[]; busy: boolean; error: string; onClose: () => void; onSubmit: (event: React.FormEvent) => void }) {
   return <><div className="drawer-head"><div><p className="eyebrow">MINECRAFT CONSOLE</p><h2>Live server console</h2></div><button className="icon-button" onClick={onClose}><X size={18} /></button></div><div className="console-warning"><ShieldCheck size={16} /><span>Commands run as the authenticated TMP operator through RCON. Never paste passwords or secrets.</span></div><div className="console-output">{output.length ? output.map((line, index) => <div key={`${index}-${line}`}><span>&gt;</span>{line}</div>) : <span className="console-empty">No commands sent this session.</span>}</div><form className="console-form" onSubmit={onSubmit}><input value={command} onChange={event => setCommand(event.target.value)} placeholder="say Hello from TMP Server" maxLength={240} autoFocus /><button className="button primary" type="submit" disabled={busy}><TerminalSquare size={15} /> {busy ? "Sending…" : "Send"}</button></form>{error && <p className="form-error">{error}</p>}</>;
 }
@@ -221,6 +228,7 @@ function Home() {
   const [session, setSession] = useState<Session | null>(null);
   const [authReady, setAuthReady] = useState(!supabaseConfigured);
   const [nav, setNav] = useState<NavKey>("overview");
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const [services, setServices] = useState<Service[]>(initialServices);
   const [activity, setActivity] = useState<Activity[]>(initialActivity);
   const [selected, setSelected] = useState<Service | null>(initialServices[0]);
@@ -242,6 +250,11 @@ function Home() {
   const [cloudUsedBytes, setCloudUsedBytes] = useState(0);
   const [cloudBusy, setCloudBusy] = useState(false);
   const [cloudError, setCloudError] = useState("");
+  const [websites, setWebsites] = useState<Website[]>([]);
+  const [websiteName, setWebsiteName] = useState("");
+  const [websiteDomain, setWebsiteDomain] = useState("");
+  const [websiteBusy, setWebsiteBusy] = useState(false);
+  const [websiteError, setWebsiteError] = useState("");
 
   useEffect(() => {
     if (!supabase) return;
@@ -285,6 +298,43 @@ function Home() {
   }
 
   useEffect(() => { if (session && hostApiUrl) void loadCloudFiles(); }, [session]);
+
+  async function loadWebsites() {
+    try { const response = await cloudRequest("/api/websites"); const payload = await response.json(); if (!response.ok) throw new Error(payload.error ?? "Could not load websites."); setWebsites(payload.sites ?? []); setWebsiteError(""); }
+    catch (error) { setWebsiteError(error instanceof Error ? error.message : "Could not load websites."); }
+  }
+
+  useEffect(() => { if (session && hostApiUrl) void loadWebsites(); }, [session]);
+
+  async function createWebsite(event: React.FormEvent) {
+    event.preventDefault(); setWebsiteBusy(true); setWebsiteError("");
+    try { const response = await cloudRequest("/api/websites", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: websiteName, domain: websiteDomain }) }); const payload = await response.json(); if (!response.ok) throw new Error(payload.error ?? "Could not create website."); setWebsiteName(""); setWebsiteDomain(""); await loadWebsites(); setNotice(`Website ${payload.site.name} created.`); }
+    catch (error) { setWebsiteError(error instanceof Error ? error.message : "Could not create website."); }
+    finally { setWebsiteBusy(false); }
+  }
+
+  async function deployWebsite(site: Website, file: File) {
+    if (!file.name.toLowerCase().endsWith(".zip")) { setWebsiteError("Choose a ZIP file."); return; }
+    setWebsiteBusy(true); setWebsiteError("");
+    try { const form = new FormData(); form.append("file", file); const response = await cloudRequest(`/api/websites/${site.slug}/deploy`, { method: "POST", body: form }); const payload = await response.json(); if (!response.ok) throw new Error(payload.error ?? "Website deployment failed."); await loadWebsites(); setNotice(`${site.name} deployed.`); }
+    catch (error) { setWebsiteError(error instanceof Error ? error.message : "Website deployment failed."); }
+    finally { setWebsiteBusy(false); }
+  }
+
+  async function websiteLifecycle(site: Website, action: "start" | "stop") {
+    setWebsiteBusy(true); setWebsiteError("");
+    try { const response = await cloudRequest(`/api/websites/${site.slug}/lifecycle`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action }) }); const payload = await response.json(); if (!response.ok) throw new Error(payload.error ?? "Website lifecycle action failed."); await loadWebsites(); setNotice(`${site.name} ${action}ed.`); }
+    catch (error) { setWebsiteError(error instanceof Error ? error.message : "Website lifecycle action failed."); }
+    finally { setWebsiteBusy(false); }
+  }
+
+  async function deleteWebsite(site: Website) {
+    if (!window.confirm(`Delete ${site.name} and all deployed files?`)) return;
+    setWebsiteBusy(true); setWebsiteError("");
+    try { const response = await cloudRequest(`/api/websites/${site.slug}/delete`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }); const payload = await response.json(); if (!response.ok) throw new Error(payload.error ?? "Website deletion failed."); await loadWebsites(); setNotice(`${site.name} deleted.`); }
+    catch (error) { setWebsiteError(error instanceof Error ? error.message : "Website deletion failed."); }
+    finally { setWebsiteBusy(false); }
+  }
 
   async function uploadCloudFile(file: File) {
     setCloudBusy(true); setCloudError("");
@@ -397,19 +447,19 @@ function Home() {
   if (!hostState) return <div className="loading-screen"><div className="loading-orbit" /><span>{hostError || "Connecting to live host…"}</span></div>;
 
   return <div className="app-shell">
-    <aside className="sidebar">
-      <div className="sidebar-top"><Logo /><button className="mobile-menu"><Menu size={18} /></button></div>
+    <aside className={`sidebar ${sidebarOpen ? "open" : ""}`}>
+      <div className="sidebar-top"><Logo /><button className="mobile-menu" onClick={() => setSidebarOpen(value => !value)} aria-label="Toggle navigation"><Menu size={18} /></button></div>
       <div className="node-switcher"><span className="node-pulse" /><span><b>tmp-node-01</b><small>standalone · primary</small></span><ChevronDown size={14} /></div>
       <nav className="nav-group">
         <p className="nav-caption">CONTROL PLANE</p>
-        {navItems.map(item => <button key={item.id} className={`nav-item ${nav === item.id ? "active" : ""}`} onClick={() => setNav(item.id)}><item.icon size={16} /><span>{item.label}</span>{item.count && <b>{item.count}</b>}</button>)}
+        {navItems.map(item => <button key={item.id} className={`nav-item ${nav === item.id ? "active" : ""}`} onClick={() => { setNav(item.id); setSidebarOpen(false); }}><item.icon size={16} /><span>{item.label}</span>{item.count && <b>{item.count}</b>}</button>)}
       </nav>
       <div className="sidebar-tree"><p className="nav-caption">FLEET</p><div className="tree-line"><ChevronDown size={13} /><Server size={14} /><span>tmp-node-01</span><span className="tree-live">online</span></div><div className="tree-children"><div><StatusDot state="running" /> live containers <b>{hostState.services.length}</b></div><div><StatusDot state="running" /> minecraft <b>{hostState.minecraft.health}</b></div><div><StatusDot state="degraded" /> agent <b>{hostState.host.architecture}</b></div></div></div>
       <div className="sidebar-bottom"><button className="nav-item"><Settings2 size={16} /><span>Settings</span></button><div className="owner-chip"><div className="avatar">{(session.user.email?.[0] ?? "O").toUpperCase()}</div><span><b>{session.user.email?.split("@")[0] ?? "member"}</b><small>{sessionLabel(session)} / online</small></span><MoreHorizontal size={16} /></div></div>
     </aside>
     <main className="main-content">
-      <header className="topbar"><div className="breadcrumbs"><span>Cluster</span><ChevronRight size={14} /><b>tmp-node-01</b><span className="slash">/</span><strong>{nav === "overview" ? "Overview" : nav[0].toUpperCase() + nav.slice(1)}</strong></div><div className="top-actions"><div className="heartbeat"><span className="heartbeat-dot" /> live · VM agent</div><button className="icon-button" title="Help"><CircleHelp size={17} /></button><button className="icon-button" title="Sign out" onClick={() => supabase?.auth.signOut()}><LogOut size={17} /></button></div></header>
-      <div className="content-scroll">{nav === "cloud" ? <CloudPanel files={cloudFiles} usedBytes={cloudUsedBytes} busy={cloudBusy} error={cloudError} onUpload={uploadCloudFile} onBackup={backupMinecraft} onDownload={downloadCloudFile} onDelete={deleteCloudFile} /> : <><section className="page-heading"><div><p className="eyebrow">CONTROL PLANE / PRIVATE HOST</p><h1>{nav === "overview" ? "Overview" : nav === "services" ? "Services" : nav === "logs" ? "Log stream" : nav === "alerts" ? "Owner alerts" : "Node telemetry"}</h1><p className="page-subtitle">Live host state from the connected Ubuntu supervisor.{staticPages && <><br /><span>GitHub Pages shell · commands run on the authenticated VM agent</span></>}</p></div><div className="heading-actions"><button className="button secondary" onClick={() => setDrawer("console")}><TerminalSquare size={15} /> Minecraft terminal</button><button className="button secondary" onClick={() => window.location.reload()}><RefreshCw size={15} /> Refresh</button>{staticPages ? <span className="backend-note">Live agent connected</span> : <><button className="button secondary" onClick={() => setDrawer("invite")}><Users size={15} /> Invite member</button>{isOwnerSession(session) && <button className="button primary" onClick={() => setDrawer("add")}><Plus size={16} /> Add service</button>}</>}</div></section>
+      <header className="topbar"><button className="mobile-top-menu" onClick={() => setSidebarOpen(value => !value)} aria-label="Open navigation"><Menu size={18} /></button><div className="breadcrumbs"><span>Cluster</span><ChevronRight size={14} /><b>tmp-node-01</b><span className="slash">/</span><strong>{nav === "overview" ? "Overview" : nav[0].toUpperCase() + nav.slice(1)}</strong></div><div className="top-actions"><div className="heartbeat"><span className="heartbeat-dot" /> live · VM agent</div><button className="icon-button" title="Help"><CircleHelp size={17} /></button><button className="icon-button" title="Sign out" onClick={() => supabase?.auth.signOut()}><LogOut size={17} /></button></div></header>
+      <div className="content-scroll">{nav === "cloud" ? <CloudPanel files={cloudFiles} usedBytes={cloudUsedBytes} busy={cloudBusy} error={cloudError} onUpload={uploadCloudFile} onBackup={backupMinecraft} onDownload={downloadCloudFile} onDelete={deleteCloudFile} /> : nav === "websites" ? <WebsitesPanel sites={websites} busy={websiteBusy} error={websiteError} name={websiteName} setName={setWebsiteName} domain={websiteDomain} setDomain={setWebsiteDomain} onCreate={createWebsite} onDeploy={deployWebsite} onLifecycle={websiteLifecycle} onDelete={deleteWebsite} /> : <><section className="page-heading"><div><p className="eyebrow">CONTROL PLANE / PRIVATE HOST</p><h1>{nav === "overview" ? "Overview" : nav === "services" ? "Services" : nav === "logs" ? "Log stream" : nav === "alerts" ? "Owner alerts" : "Node telemetry"}</h1><p className="page-subtitle">Live host state from the connected Ubuntu supervisor.{staticPages && <><br /><span>GitHub Pages shell · commands run on the authenticated VM agent</span></>}</p></div><div className="heading-actions"><button className="button secondary" onClick={() => setDrawer("console")}><TerminalSquare size={15} /> Minecraft terminal</button><button className="button secondary" onClick={() => window.location.reload()}><RefreshCw size={15} /> Refresh</button>{staticPages ? <span className="backend-note">Live agent connected</span> : <><button className="button secondary" onClick={() => setDrawer("invite")}><Users size={15} /> Invite member</button>{isOwnerSession(session) && <button className="button primary" onClick={() => setDrawer("add")}><Plus size={16} /> Add service</button>}</>}</div></section>
         <div className="security-strip"><ShieldCheck size={15} /><span><b>Owner access active</b> · Supabase session verified against the configured allowlist</span><span className="strip-end">authenticated VM agent connected · commands are sent via protected RCON</span></div>
         <section className="metric-grid"><MetricCard label="LIVE SERVICES" value={`${running}`} suffix={` / ${services.length}`} detail={`${degraded} degraded`} tone="cyan" icon={ActivityIcon} /><MetricCard label="ONLINE PLAYERS" value={`${hostState.minecraft.onlinePlayers}`} suffix={` / ${hostState.minecraft.maxPlayers || "—"}`} detail="Live RCON count" icon={Users} /><MetricCard label="MEMORY" value={`${hostState.memory.usedPercent}`} suffix="%" detail={`${formatBytes(hostState.memory.totalBytes - hostState.memory.availableBytes)} used · ${formatBytes(hostState.memory.totalBytes)} total`} tone="violet" icon={MemoryStick}><div className="meter"><span style={{ width: `${hostState.memory.usedPercent}%` }} /></div></MetricCard><MetricCard label="STORAGE" value={`${hostState.disk.usedPercent}`} suffix="%" detail={`${formatBytes(hostState.disk.freeBytes)} free`} tone="amber" icon={HardDrive}><div className="meter amber"><span style={{ width: `${hostState.disk.usedPercent}%` }} /></div></MetricCard></section>
         <section className="main-grid"><div className="panel service-panel"><div className="panel-header"><div><p className="eyebrow">SERVICE REGISTRY</p><h2>Running services <span>{visibleServices.length} visible</span></h2></div><div className="panel-tools"><div className="search-input"><Search size={14} /><input value={search} onChange={event => setSearch(event.target.value)} placeholder="Filter services" /></div><button className="icon-button"><Filter size={16} /></button><button className="icon-button"><MoreHorizontal size={16} /></button></div></div><div className="table-wrap"><table><thead><tr><th>SERVICE</th><th>STATE</th><th>HEALTH</th><th>CPU</th><th>MEMORY</th><th>UPTIME</th><th /></tr></thead><tbody>{visibleServices.map(service => <tr key={service.id} className={selected?.id === service.id ? "selected-row" : ""} onClick={() => { setSelected(service); setDrawer("service"); }}><td><div className="service-name"><ServiceIcon kind={service.kind} /><span><b>{service.name}</b><small>{service.domain ? `${service.domain} · ` : ""}{service.description}</small></span></div></td><td><StateBadge state={service.state} /></td><td><div className="health-cell"><span className="health-bar"><i className={service.health < 80 ? "warning" : ""} style={{ width: `${service.health}%` }} /></span><small>{service.health}%</small></div></td><td className="mono">{service.cpu < 0 ? "—" : `${service.cpu}%`}</td><td><div className="memory-cell"><span>{service.memory < 0 ? "—" : `${service.memory}%`}</span><span className="memory-bar"><i style={{ width: `${Math.max(0, service.memory)}%` }} /></span></div></td><td className="mono muted">{service.uptime}</td><td><button className="row-menu" onClick={event => { event.stopPropagation(); setSelected(service); setDrawer("service"); }}><MoreHorizontal size={16} /></button></td></tr>)}</tbody></table></div><div className="panel-footer"><span><span className="green-dot" /> {running} running</span><span><span className="amber-dot" /> {degraded} attention</span><button className="text-button" onClick={() => setNav("services")}>Open full registry <ArrowUpRight size={14} /></button></div></div>

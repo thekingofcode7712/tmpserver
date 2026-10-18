@@ -9,6 +9,8 @@ import shlex
 import shutil
 import subprocess
 import time
+import tempfile
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 from urllib.error import HTTPError, URLError
@@ -33,8 +35,12 @@ CONSOLE_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,240}$")
 COMPOSE_FILE = "/opt/tmpserver/minecraft/compose.yml"
 BACKUP_SCRIPT = "/usr/local/bin/tmpserver-minecraft-backup"
 CLOUD_ROOT = "/opt/tmpserver/cloud"
+WEBSITES_ROOT = "/opt/tmpserver/websites"
+WEBSITES_INDEX = os.path.join(WEBSITES_ROOT, "sites.json")
+CADDYFILE = "/etc/caddy/Caddyfile"
 MAX_UPLOAD = 50 * 1024 * 1024
 os.makedirs(CLOUD_ROOT, exist_ok=True)
+os.makedirs(WEBSITES_ROOT, exist_ok=True)
 
 
 def json_bytes(value):
@@ -155,6 +161,52 @@ def cloud_files():
             stat = os.stat(full)
             result.append({"path": relative, "name": name, "size": stat.st_size, "modified": int(stat.st_mtime)})
     return sorted(result, key=lambda item: item["path"].lower())
+def website_slug(value):
+    slug = re.sub(r"[^a-z0-9-]+", "-", str(value or "").strip().lower()).strip("-")
+    return slug[:48] or None
+def website_domain(value):
+    domain = str(value or "").strip().lower().rstrip(".")
+    if not re.fullmatch(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}", domain):
+        return None
+    return domain
+def read_websites():
+    try:
+        with open(WEBSITES_INDEX, "r", encoding="utf-8") as file:
+            data = json.load(file)
+        return data if isinstance(data, list) else []
+    except (OSError, json.JSONDecodeError):
+        return []
+def write_websites(sites):
+    temp = f"{WEBSITES_INDEX}.tmp"
+    with open(temp, "w", encoding="utf-8") as file:
+        json.dump(sites, file, indent=2)
+    os.replace(temp, WEBSITES_INDEX)
+def website_state(site):
+    public_root = os.path.join(WEBSITES_ROOT, site["slug"], "public")
+    return {**site, "files": sum(len(names) for _, _, names in os.walk(public_root)) if os.path.isdir(public_root) else 0, "bytes": sum(os.path.getsize(os.path.join(root, name)) for root, _, names in os.walk(public_root) for name in names) if os.path.isdir(public_root) else 0}
+def reload_caddy(sites):
+    try:
+        with open(CADDYFILE, "r", encoding="utf-8") as file:
+            base = file.read().split("\n# TMP_SERVER_WEBSITES\n", 1)[0].rstrip()
+        blocks = []
+        for site in sites:
+            if site.get("active"):
+                root = os.path.join(WEBSITES_ROOT, site["slug"], "public")
+                blocks.append(f"{site['domain']} {{\n    root * {root}\n    encode gzip\n    file_server\n}}")
+        content = base + "\n\n# TMP_SERVER_WEBSITES\n" + ("\n\n".join(blocks) if blocks else "") + "\n"
+        fd, path = tempfile.mkstemp(prefix="tmpserver-caddy-", text=True)
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            file.write(content)
+        code, stdout, stderr = run(["caddy", "validate", "--config", path, "--adapter", "caddyfile"], timeout=20)
+        if code != 0:
+            os.remove(path)
+            return False, stderr[-500:] or stdout[-500:]
+        shutil.copyfile(path, CADDYFILE)
+        os.remove(path)
+        code, stdout, stderr = run(["systemctl", "reload", "caddy"], timeout=20)
+        return code == 0, stderr[-500:] or stdout[-500:]
+    except (OSError, subprocess.SubprocessError) as error:
+        return False, str(error)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -204,6 +256,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(401, {"error": "authenticated Supabase session required"})
                 return
             self.send_json(200, {"files": cloud_files(), "usedBytes": sum(item["size"] for item in cloud_files())})
+            return
+        if self.path == "/api/websites":
+            if not auth_user(self):
+                self.send_json(401, {"error": "authenticated Supabase session required"})
+                return
+            self.send_json(200, {"sites": [website_state(site) for site in read_websites()]})
             return
         parsed = urlparse(self.path)
         if parsed.path == "/api/cloud/download":
@@ -260,12 +318,122 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as error:
                 self.send_json(400, {"error": f"cloud operation failed: {error}"})
                 return
-        if self.path not in {"/api/minecraft/whitelist", "/api/minecraft/command", "/api/minecraft/lifecycle", "/api/minecraft/backup"}:
+        website_match = re.fullmatch(r"/api/websites/([a-z0-9-]+)/(deploy|lifecycle|delete)", self.path)
+        if self.path not in {"/api/minecraft/whitelist", "/api/minecraft/command", "/api/minecraft/lifecycle", "/api/minecraft/backup", "/api/websites"} and not website_match:
             self.send_json(404, {"error": "not found"})
             return
         if not auth_user(self):
             self.send_json(401, {"error": "owner or invited member session required"})
             return
+        if self.path == "/api/websites" or website_match:
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length > MAX_UPLOAD + 4096:
+                    self.send_json(413, {"error": "website upload is larger than the 50 MB limit"})
+                    return
+                sites = read_websites()
+                if website_match and website_match.group(2) == "deploy":
+                    content_type = self.headers.get("Content-Type", "")
+                    if "multipart/form-data" not in content_type:
+                        self.send_json(400, {"error": "Upload a ZIP file using multipart/form-data."})
+                        return
+                    form = cgi.FieldStorage(fp=io.BytesIO(self.rfile.read(length)), headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": content_type, "CONTENT_LENGTH": str(length)})
+                    item = form["file"] if "file" in form else None
+                    slug = website_match.group(1)
+                    site = next((entry for entry in sites if entry["slug"] == slug), None)
+                    if not item or not site or not str(item.filename or "").lower().endswith(".zip"):
+                        self.send_json(400, {"error": "Choose a ZIP file for an existing website."})
+                        return
+                    target_root = os.path.join(WEBSITES_ROOT, slug, "public")
+                    with tempfile.TemporaryDirectory(prefix="tmpserver-site-") as temp_root:
+                        archive_path = os.path.join(temp_root, "site.zip")
+                        with open(archive_path, "wb") as archive_file:
+                            shutil.copyfileobj(item.file, archive_file)
+                        with zipfile.ZipFile(archive_path) as archive:
+                            members = archive.infolist()
+                            if len(members) > 10000 or any(member.file_size > MAX_UPLOAD for member in members):
+                                self.send_json(413, {"error": "ZIP contains too many or too-large files."})
+                                return
+                            for member in members:
+                                member_path = os.path.realpath(os.path.join(temp_root, "unzipped", member.filename))
+                                safe_root = os.path.realpath(os.path.join(temp_root, "unzipped"))
+                                if not member_path.startswith(safe_root + os.sep):
+                                    self.send_json(400, {"error": "ZIP contains an unsafe path."})
+                                    return
+                            archive.extractall(os.path.join(temp_root, "unzipped"))
+                        extracted = os.path.join(temp_root, "unzipped")
+                        candidate = os.path.join(extracted, "index.html")
+                        if not os.path.isfile(candidate):
+                            children = [name for name in os.listdir(extracted) if os.path.isdir(os.path.join(extracted, name))]
+                            if len(children) == 1 and os.path.isfile(os.path.join(extracted, children[0], "index.html")):
+                                extracted = os.path.join(extracted, children[0])
+                            else:
+                                self.send_json(400, {"error": "ZIP must contain index.html at its root."})
+                                return
+                        new_root = os.path.join(target_root, ".new")
+                        shutil.rmtree(new_root, ignore_errors=True)
+                        shutil.copytree(extracted, new_root)
+                        old_root = os.path.join(target_root, ".old")
+                        shutil.rmtree(old_root, ignore_errors=True)
+                        if os.path.isdir(target_root):
+                            os.rename(target_root, old_root)
+                        os.rename(new_root, target_root)
+                        shutil.rmtree(old_root, ignore_errors=True)
+                    site["updated"] = int(time.time())
+                    write_websites(sites)
+                    self.send_json(200, {"ok": True, "site": website_state(site)})
+                    return
+                payload = json.loads(self.rfile.read(length) or b"{}")
+                if self.path == "/api/websites":
+                    name = str(payload.get("name", "")).strip()
+                    slug = website_slug(payload.get("slug") or name)
+                    domain = website_domain(payload.get("domain"))
+                    if not name or not slug or not domain:
+                        self.send_json(400, {"error": "Enter a site name and a valid domain."})
+                        return
+                    if any(site["slug"] == slug or site["domain"] == domain for site in sites):
+                        self.send_json(409, {"error": "A website with that name or domain already exists."})
+                        return
+                    os.makedirs(os.path.join(WEBSITES_ROOT, slug, "public"), exist_ok=True)
+                    site = {"name": name[:80], "slug": slug, "domain": domain, "active": False, "created": int(time.time()), "updated": int(time.time())}
+                    sites.append(site)
+                    write_websites(sites)
+                    self.send_json(201, {"ok": True, "site": website_state(site)})
+                    return
+                slug, action = website_match.group(1), website_match.group(2)
+                site = next((item for item in sites if item["slug"] == slug), None)
+                if not site:
+                    self.send_json(404, {"error": "Website not found."})
+                    return
+                if action == "lifecycle":
+                    operation = str(payload.get("action", "")).strip().lower()
+                    if operation not in {"start", "stop"}:
+                        self.send_json(400, {"error": "Website action must be start or stop."})
+                        return
+                    site["active"] = operation == "start"
+                    site["updated"] = int(time.time())
+                    ok, detail = reload_caddy(sites)
+                    if not ok:
+                        site["active"] = not site["active"]
+                        self.send_json(502, {"error": "Caddy rejected the website route.", "detail": detail})
+                        return
+                    write_websites(sites)
+                    self.send_json(200, {"ok": True, "site": website_state(site)})
+                    return
+                if action == "delete":
+                    ok, detail = reload_caddy([item for item in sites if item["slug"] != slug])
+                    if not ok:
+                        self.send_json(502, {"error": "Could not remove the website route.", "detail": detail})
+                        return
+                    shutil.rmtree(os.path.join(WEBSITES_ROOT, slug), ignore_errors=True)
+                    write_websites([item for item in sites if item["slug"] != slug])
+                    self.send_json(200, {"ok": True, "slug": slug})
+                    return
+                self.send_json(400, {"error": "Unsupported website operation."})
+                return
+            except (OSError, ValueError, json.JSONDecodeError) as error:
+                self.send_json(400, {"error": f"Website operation failed: {error}"})
+                return
         try:
             length = int(self.headers.get("Content-Length", "0"))
             payload = json.loads(self.rfile.read(length))

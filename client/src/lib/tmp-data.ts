@@ -47,6 +47,7 @@ export type HostState = {
 };
 
 export type CloudFile = { path: string; name: string; size: number; modified: number };
+export type Website = { name: string; slug: string; domain: string; active: boolean; created: number; updated: number; files: number; bytes: number };
 
 // Live data is intentionally empty until a real supervisor agent is connected.
 // Never populate these arrays with representative values: the dashboard must not
