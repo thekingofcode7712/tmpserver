@@ -254,3 +254,10 @@ table { width: 100%; border-collapse: collapse; min-width: 720px; } th { color: 
 .settings-card > .button.full { margin: 12px 16px 0; width: calc(100% - 32px); }
 .settings-card > .route-help { margin: 10px 16px 0; }
 @media (max-width: 760px) { .settings-grid { grid-template-columns: 1fr; } .settings-form { grid-template-columns: 1fr; } .settings-form .button { width: 100%; } }
+.capability-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; padding: 16px; }
+.capability-grid > div { min-width: 0; padding: 12px; background: #0d1826; border: 1px solid var(--border-soft); border-radius: 3px; }
+.capability-grid span { display: block; color: #637790; font: 600 9px "IBM Plex Mono", monospace; letter-spacing: .08em; }
+.capability-grid b { display: block; color: #d8e8f4; font: 600 12px "IBM Plex Mono", monospace; margin: 7px 0 5px; }
+.capability-grid small { color: #7f93aa; font-size: 10px; line-height: 1.4; }
+@media (max-width: 900px) { .capability-grid { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 420px) { .capability-grid { grid-template-columns: 1fr; } }

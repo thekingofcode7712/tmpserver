@@ -249,6 +249,45 @@ def update_minecraft_settings(payload):
     with open(COMPOSE_FILE, "w", encoding="utf-8") as file:
         file.write(text)
     return minecraft_settings()
+def admin_snapshot():
+    storage = []
+    code, output, _ = run(["df", "-P", "-B1", "/", CLOUD_ROOT, "/opt/tmpserver/websites"])
+    if code == 0:
+        for line in output.splitlines()[1:]:
+            fields = line.split()
+            if len(fields) >= 6:
+                try:
+                    total, used, free = int(fields[1]), int(fields[2]), int(fields[3])
+                    storage.append({"filesystem": fields[0], "mount": fields[5], "totalBytes": total, "usedBytes": used, "freeBytes": free, "usedPercent": round(used / total * 100, 1) if total else 0})
+                except ValueError:
+                    continue
+    firewall = {"active": False, "defaultIncoming": "unknown", "rules": []}
+    code, output, _ = run(["ufw", "status", "verbose"])
+    if code == 0:
+        firewall["active"] = output.startswith("Status: active")
+        match = re.search(r"Default:\s+([^,]+),", output)
+        firewall["defaultIncoming"] = match.group(1).strip() if match else "unknown"
+        for line in output.splitlines():
+            if re.match(r"^\d", line.strip()):
+                firewall["rules"].append(line.strip())
+    docker_version = "unknown"
+    docker_root = "unknown"
+    docker_cpus = 0
+    docker_memory = 0
+    code, output, _ = run(["docker", "info", "--format", "{{.ServerVersion}}|{{.DockerRootDir}}|{{.NCPU}}|{{.MemTotal}}"])
+    if code == 0:
+        fields = output.split("|")
+        if len(fields) == 4:
+            docker_version, docker_root = fields[0], fields[1]
+            try:
+                docker_cpus, docker_memory = int(fields[2]), int(fields[3])
+            except ValueError:
+                pass
+    failed_units = []
+    code, output, _ = run(["systemctl", "--failed", "--no-legend"])
+    if code == 0:
+        failed_units = [line.split()[0] for line in output.splitlines() if line.split()]
+    return {"storage": storage, "docker": {"version": docker_version, "root": docker_root, "cpus": docker_cpus, "memoryBytes": docker_memory}, "firewall": firewall, "capabilities": {"kvm": os.path.exists("/dev/kvm"), "lxcInstalled": shutil.which("lxc") is not None, "docker": docker_version != "unknown", "nativeVmManagement": False}, "failedUnits": failed_units}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -329,7 +368,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             backup_path = os.path.join(CLOUD_ROOT, "minecraft-latest.tar.gz")
             backup_stat = os.stat(backup_path) if os.path.isfile(backup_path) else None
-            self.send_json(200, {"host": host_state()["host"], "minecraft": minecraft_settings(), "agent": {"status": "connected", "uptimeSeconds": round(time.time() - STARTED)}, "backup": {"present": bool(backup_stat), "bytes": backup_stat.st_size if backup_stat else 0, "modified": int(backup_stat.st_mtime) if backup_stat else 0}, "permissions": {"owner": owner_user(user)}})
+            self.send_json(200, {"host": host_state()["host"], "minecraft": minecraft_settings(), "agent": {"status": "connected", "uptimeSeconds": round(time.time() - STARTED)}, "backup": {"present": bool(backup_stat), "bytes": backup_stat.st_size if backup_stat else 0, "modified": int(backup_stat.st_mtime) if backup_stat else 0}, "permissions": {"owner": owner_user(user)}, "admin": admin_snapshot()})
             return
         self.send_json(404, {"error": "not found"})
 

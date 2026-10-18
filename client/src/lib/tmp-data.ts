@@ -48,7 +48,7 @@ export type HostState = {
 
 export type CloudFile = { path: string; name: string; size: number; modified: number };
 export type Website = { name: string; slug: string; domain: string; active: boolean; created: number; updated: number; files: number; bytes: number };
-export type SettingsSnapshot = { host: HostState["host"]; minecraft: { viewDistance: number; simulationDistance: number; maxPlayers: number; whitelist: boolean }; agent: { status: string; uptimeSeconds: number }; backup: { present: boolean; bytes: number; modified: number }; permissions: { owner: boolean } };
+export type SettingsSnapshot = { host: HostState["host"]; minecraft: { viewDistance: number; simulationDistance: number; maxPlayers: number; whitelist: boolean }; agent: { status: string; uptimeSeconds: number }; backup: { present: boolean; bytes: number; modified: number }; permissions: { owner: boolean }; admin: { storage: { filesystem: string; mount: string; totalBytes: number; usedBytes: number; freeBytes: number; usedPercent: number }[]; docker: { version: string; root: string; cpus: number; memoryBytes: number }; firewall: { active: boolean; defaultIncoming: string; rules: string[] }; capabilities: { kvm: boolean; lxcInstalled: boolean; docker: boolean; nativeVmManagement: boolean }; failedUnits: string[] } };
 
 // Live data is intentionally empty until a real supervisor agent is connected.
 // Never populate these arrays with representative values: the dashboard must not
