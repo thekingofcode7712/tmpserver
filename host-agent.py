@@ -59,16 +59,16 @@ def network_state():
                 fields = values.split()
                 if interface == "lo" or len(fields) < 16:
                     continue
-                counters[interface] = {"rxBytes": int(fields[0]), "rxPackets": int(fields[1]), "txBytes": int(fields[8]), "txPackets": int(fields[9])}
+                counters[interface] = {"rxBytes": int(fields[0]), "rxPackets": int(fields[1]), "rxDropped": int(fields[3]), "txBytes": int(fields[8]), "txPackets": int(fields[9]), "txDropped": int(fields[11])}
     except (OSError, ValueError):
-        return {"interface": "—", "linkMbps": 0, "rxBytes": 0, "txBytes": 0, "rxBytesPerSecond": 0, "txBytesPerSecond": 0, "rxPacketsPerSecond": 0, "txPacketsPerSecond": 0}
+        return {"interface": "—", "linkMbps": 0, "sampleSeconds": 0, "rxBytes": 0, "txBytes": 0, "rxBytesPerSecond": 0, "txBytesPerSecond": 0, "rxPacketsPerSecond": 0, "txPacketsPerSecond": 0, "rxDropped": 0, "txDropped": 0}
     interface = next(iter(counters), "—")
     try:
         with open(f"/sys/class/net/{interface}/speed", "r", encoding="utf-8") as file:
             link_mbps = max(0, int(file.read().strip()))
     except (OSError, ValueError):
         link_mbps = 0
-    current = counters.get(interface, {"rxBytes": 0, "rxPackets": 0, "txBytes": 0, "txPackets": 0})
+    current = counters.get(interface, {"rxBytes": 0, "rxPackets": 0, "rxDropped": 0, "txBytes": 0, "txPackets": 0, "txDropped": 0})
     now = time.monotonic()
     previous = NETWORK_SAMPLE
     elapsed = now - previous["time"] if previous else 0
@@ -80,7 +80,7 @@ def network_state():
     else:
         rx_rate = tx_rate = rx_packets_rate = tx_packets_rate = 0
     NETWORK_SAMPLE = {"time": now, "interface": interface, **current}
-    return {"interface": interface, "linkMbps": link_mbps, **current, "rxBytesPerSecond": round(rx_rate, 1), "txBytesPerSecond": round(tx_rate, 1), "rxPacketsPerSecond": round(rx_packets_rate, 1), "txPacketsPerSecond": round(tx_packets_rate, 1)}
+    return {"interface": interface, "linkMbps": link_mbps, "sampleSeconds": round(elapsed, 1), **current, "rxBytesPerSecond": round(rx_rate, 1), "txBytesPerSecond": round(tx_rate, 1), "rxPacketsPerSecond": round(rx_packets_rate, 1), "txPacketsPerSecond": round(tx_packets_rate, 1)}
 
 
 def auth_user(handler):
