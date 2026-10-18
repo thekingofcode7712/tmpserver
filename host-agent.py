@@ -27,6 +27,7 @@ ALLOWED_ORIGINS = {
 ALLOWED_ORIGINS.update({"https://tmpserver.com", "https://www.tmpserver.com"})
 PUBLIC_HOSTNAME = os.environ.get("PUBLIC_HOSTNAME", "140.238.70.11")
 STARTED = time.time()
+NETWORK_SAMPLE = None
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_\.]{3,16}$")
 CONSOLE_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,240}$")
 COMPOSE_FILE = "/opt/tmpserver/minecraft/compose.yml"
@@ -43,6 +44,43 @@ def json_bytes(value):
 def run(command, timeout=15):
     result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
     return result.returncode, result.stdout.strip(), result.stderr.strip()
+
+
+def network_state():
+    global NETWORK_SAMPLE
+    counters = {}
+    try:
+        with open("/proc/net/dev", "r", encoding="utf-8") as file:
+            for line in file:
+                if ":" not in line:
+                    continue
+                interface, values = line.split(":", 1)
+                interface = interface.strip()
+                fields = values.split()
+                if interface == "lo" or len(fields) < 16:
+                    continue
+                counters[interface] = {"rxBytes": int(fields[0]), "rxPackets": int(fields[1]), "txBytes": int(fields[8]), "txPackets": int(fields[9])}
+    except (OSError, ValueError):
+        return {"interface": "—", "linkMbps": 0, "rxBytes": 0, "txBytes": 0, "rxBytesPerSecond": 0, "txBytesPerSecond": 0, "rxPacketsPerSecond": 0, "txPacketsPerSecond": 0}
+    interface = next(iter(counters), "—")
+    try:
+        with open(f"/sys/class/net/{interface}/speed", "r", encoding="utf-8") as file:
+            link_mbps = max(0, int(file.read().strip()))
+    except (OSError, ValueError):
+        link_mbps = 0
+    current = counters.get(interface, {"rxBytes": 0, "rxPackets": 0, "txBytes": 0, "txPackets": 0})
+    now = time.monotonic()
+    previous = NETWORK_SAMPLE
+    elapsed = now - previous["time"] if previous else 0
+    if previous and elapsed > 0 and previous["interface"] == interface:
+        rx_rate = max(0, current["rxBytes"] - previous["rxBytes"]) / elapsed
+        tx_rate = max(0, current["txBytes"] - previous["txBytes"]) / elapsed
+        rx_packets_rate = max(0, current["rxPackets"] - previous["rxPackets"]) / elapsed
+        tx_packets_rate = max(0, current["txPackets"] - previous["txPackets"]) / elapsed
+    else:
+        rx_rate = tx_rate = rx_packets_rate = tx_packets_rate = 0
+    NETWORK_SAMPLE = {"time": now, "interface": interface, **current}
+    return {"interface": interface, "linkMbps": link_mbps, **current, "rxBytesPerSecond": round(rx_rate, 1), "txBytesPerSecond": round(tx_rate, 1), "rxPacketsPerSecond": round(rx_packets_rate, 1), "txPacketsPerSecond": round(tx_packets_rate, 1)}
 
 
 def auth_user(handler):
@@ -76,6 +114,7 @@ def host_state():
     total = mem.get("MemTotal", 0)
     available = mem.get("MemAvailable", 0)
     disk = shutil.disk_usage("/")
+    network = network_state()
     health_code, health, _ = run(["docker", "inspect", "--format", "{{.State.Health.Status}}", "tmpserver-minecraft"])
     if health_code != 0:
         health = "unknown"
@@ -93,6 +132,7 @@ def host_state():
         "host": {"hostname": os.uname().nodename, "os": "Ubuntu 24.04", "architecture": os.uname().machine, "uptimeSeconds": round(uptime), "agentUptimeSeconds": round(time.time() - STARTED)},
         "memory": {"totalBytes": total, "availableBytes": available, "usedPercent": round((total - available) / total * 100, 1) if total else 0},
         "disk": {"totalBytes": disk.total, "freeBytes": disk.free, "usedPercent": round((disk.total - disk.free) / disk.total * 100, 1) if disk.total else 0},
+        "network": network,
         "minecraft": {"container": "tmpserver-minecraft", "health": health, "portJava": 25565, "portBedrock": 19132, "onlinePlayers": online_players, "maxPlayers": max_players, "publicHostname": PUBLIC_HOSTNAME},
         "services": services,
     }
