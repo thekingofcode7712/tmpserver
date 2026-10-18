@@ -209,6 +209,46 @@ def reload_caddy(sites):
         return code == 0, stderr[-500:] or stdout[-500:]
     except (OSError, subprocess.SubprocessError) as error:
         return False, str(error)
+def owner_user(user):
+    return bool(user and str(user.get("email", "")).strip().lower() == OWNER_EMAIL)
+def minecraft_settings():
+    values = {"viewDistance": 0, "simulationDistance": 0, "maxPlayers": 0, "whitelist": False}
+    try:
+        with open(os.path.join(os.path.dirname(COMPOSE_FILE), "compose.yml"), "r", encoding="utf-8") as file:
+            text = file.read()
+        for key, pattern in [("viewDistance", r"VIEW_DISTANCE:\s*(\d+)"), ("simulationDistance", r"SIMULATION_DISTANCE:\s*(\d+)"), ("maxPlayers", r"MAX_PLAYERS:\s*(\d+)")]:
+            match = re.search(pattern, text)
+            if match:
+                values[key] = int(match.group(1))
+        values["whitelist"] = bool(re.search(r"ENABLE_WHITELIST:\s*true", text, re.IGNORECASE))
+    except (OSError, ValueError):
+        pass
+    return values
+def update_minecraft_settings(payload):
+    try:
+        view_distance = int(payload.get("viewDistance"))
+        simulation_distance = int(payload.get("simulationDistance"))
+        max_players = int(payload.get("maxPlayers"))
+    except (TypeError, ValueError):
+        raise ValueError("Minecraft settings must be whole numbers.")
+    if not 2 <= view_distance <= 32:
+        raise ValueError("View distance must be between 2 and 32 chunks.")
+    if not 2 <= simulation_distance <= 32:
+        raise ValueError("Simulation distance must be between 2 and 32 chunks.")
+    if not 1 <= max_players <= 1000:
+        raise ValueError("Max players must be between 1 and 1000.")
+    with open(COMPOSE_FILE, "r", encoding="utf-8") as file:
+        text = file.read()
+    replacements = [(r"(?m)^(\s*VIEW_DISTANCE:\s*)\d+", rf"\g<1>{view_distance}"), (r"(?m)^(\s*SIMULATION_DISTANCE:\s*)\d+", rf"\g<1>{simulation_distance}"), (r"(?m)^(\s*MAX_PLAYERS:\s*)\d+", rf"\g<1>{max_players}")]
+    for pattern, replacement in replacements:
+        text, count = re.subn(pattern, replacement, text, count=1)
+        if count != 1:
+            raise ValueError("Minecraft compose file is missing a supported setting.")
+    backup_path = f"{COMPOSE_FILE}.settings.bak"
+    shutil.copy2(COMPOSE_FILE, backup_path)
+    with open(COMPOSE_FILE, "w", encoding="utf-8") as file:
+        file.write(text)
+    return minecraft_settings()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -282,6 +322,15 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_json(200, host_state())
             return
+        if self.path == "/api/settings":
+            user = auth_user(self)
+            if not user:
+                self.send_json(401, {"error": "authenticated Supabase session required"})
+                return
+            backup_path = os.path.join(CLOUD_ROOT, "minecraft-latest.tar.gz")
+            backup_stat = os.stat(backup_path) if os.path.isfile(backup_path) else None
+            self.send_json(200, {"host": host_state()["host"], "minecraft": minecraft_settings(), "agent": {"status": "connected", "uptimeSeconds": round(time.time() - STARTED)}, "backup": {"present": bool(backup_stat), "bytes": backup_stat.st_size if backup_stat else 0, "modified": int(backup_stat.st_mtime) if backup_stat else 0}, "permissions": {"owner": owner_user(user)}})
+            return
         self.send_json(404, {"error": "not found"})
 
     def do_POST(self):
@@ -321,12 +370,44 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": f"cloud operation failed: {error}"})
                 return
         website_match = re.fullmatch(r"/api/websites/([a-z0-9-]+)/(deploy|lifecycle|delete)", self.path)
-        if self.path not in {"/api/minecraft/whitelist", "/api/minecraft/command", "/api/minecraft/lifecycle", "/api/minecraft/backup", "/api/websites"} and not website_match:
+        if self.path not in {"/api/minecraft/whitelist", "/api/minecraft/command", "/api/minecraft/lifecycle", "/api/minecraft/backup", "/api/minecraft/settings", "/api/websites"} and not website_match:
             self.send_json(404, {"error": "not found"})
             return
         if not auth_user(self):
             self.send_json(401, {"error": "owner or invited member session required"})
             return
+        if self.path == "/api/minecraft/settings":
+            user = auth_user(self)
+            if not owner_user(user):
+                self.send_json(403, {"error": "Only the configured TMP Server owner can change Minecraft settings."})
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = json.loads(self.rfile.read(length) or b"{}")
+                stop_code, stop_stdout, stop_stderr = run(["docker", "compose", "-f", COMPOSE_FILE, "stop", "minecraft"], timeout=60)
+                if stop_code != 0:
+                    self.send_json(502, {"error": "Minecraft could not be stopped safely; settings were not changed.", "detail": stop_stderr[-300:] or stop_stdout[-300:]})
+                    return
+                backup_code, backup_stdout, backup_stderr = run([BACKUP_SCRIPT], timeout=240)
+                if backup_code != 0:
+                    run(["docker", "compose", "-f", COMPOSE_FILE, "up", "-d", "minecraft"], timeout=90)
+                    self.send_json(502, {"error": "Minecraft backup failed; settings were not applied.", "detail": backup_stderr[-300:] or backup_stdout[-300:]})
+                    return
+                try:
+                    settings = update_minecraft_settings(payload)
+                except (OSError, ValueError) as error:
+                    run(["docker", "compose", "-f", COMPOSE_FILE, "up", "-d", "minecraft"], timeout=90)
+                    raise error
+                stop_code, stop_stdout2, stop_stderr2 = run(["docker", "compose", "-f", COMPOSE_FILE, "up", "-d", "minecraft"], timeout=90)
+                stop_stdout = f"{stop_stdout}\n{stop_stdout2}"; stop_stderr = f"{stop_stderr}\n{stop_stderr2}"
+                if stop_code != 0:
+                    self.send_json(502, {"error": "Minecraft restart failed after settings change.", "detail": stop_stderr[-300:] or stop_stdout[-300:]})
+                    return
+                self.send_json(200, {"ok": True, "settings": settings, "state": host_state()})
+                return
+            except (OSError, ValueError, json.JSONDecodeError) as error:
+                self.send_json(400, {"error": str(error)})
+                return
         if self.path == "/api/websites" or website_match:
             try:
                 length = int(self.headers.get("Content-Length", "0"))

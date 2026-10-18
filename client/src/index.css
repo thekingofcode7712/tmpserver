@@ -240,3 +240,17 @@ table { width: 100%; border-collapse: collapse; min-width: 720px; } th { color: 
   .node-stat-row { grid-template-columns: 1fr; gap: 10px; }
   .node-stat-row > div + div { padding: 10px 0 0; border-top: 1px solid var(--border-soft); border-left: 0; }
 }
+
+.settings-page { display: grid; gap: 16px; }
+.settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.settings-card { min-width: 0; padding-bottom: 16px; }
+.settings-icon { color: var(--cyan); }
+.settings-list { display: grid; gap: 0; padding: 0 16px; }
+.settings-list > div, .settings-readonly { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 0; border-bottom: 1px solid var(--border-soft); }
+.settings-list span, .settings-readonly span { color: #637790; font: 600 9px "IBM Plex Mono", monospace; letter-spacing: .08em; }
+.settings-list b, .settings-readonly b { color: #cfe0ee; font: 500 11px "IBM Plex Mono", monospace; text-align: right; }
+.settings-form { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; padding: 16px; }
+.settings-form .button { grid-column: 1 / -1; justify-self: start; }
+.settings-card > .button.full { margin: 12px 16px 0; width: calc(100% - 32px); }
+.settings-card > .route-help { margin: 10px 16px 0; }
+@media (max-width: 760px) { .settings-grid { grid-template-columns: 1fr; } .settings-form { grid-template-columns: 1fr; } .settings-form .button { width: 100%; } }
