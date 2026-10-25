@@ -1,0 +1,28 @@
+[Unit]
+Description=TMP Server host agent for %i
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+SupplementaryGroups=docker
+WorkingDirectory=/home/%i/server-stack/app
+EnvironmentFile=/etc/tmpserver-host-agent.env
+ExecStart=/usr/bin/python3 /home/%i/server-stack/app/host-agent.py
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=false
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/home/%i/server-stack /home/%i/.local/share/tmpserver
+
+[Install]
+WantedBy=multi-user.target

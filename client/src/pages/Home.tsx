@@ -57,10 +57,10 @@ import {
   type ServiceState,
   utilization,
 } from "@/lib/tmp-data";
-import { isAllowedSession, isOwnerSession, ownerEmail, sessionLabel, supabase, supabaseConfigured } from "@/lib/supabase";
+import { isOwnerSession, ownerEmail, sessionLabel, supabase, supabaseConfigured } from "@/lib/supabase";
 
 const staticPages = import.meta.env.VITE_STATIC_ONLY === "true";
-const hostApiUrl = (import.meta.env.VITE_HOST_API_URL as string | undefined)?.trim() ?? "";
+const hostApiUrl = ((import.meta.env.VITE_HOST_API_URL as string | undefined)?.trim() ?? "").replace(/\/+$/, "");
 
 type NavKey = "overview" | "services" | "nodes" | "logs" | "alerts" | "websites" | "cloud" | "settings";
 
@@ -284,13 +284,13 @@ function Home() {
     let active = true;
     async function loadHostState() {
       try {
-        const response = await fetch(`${hostApiUrl}/api/state`, { headers: { Authorization: `Bearer ${session?.access_token ?? ""}` } });
+        const response = await fetch(`${hostApiUrl}/api/state`, { credentials: "include", headers: { Authorization: `Bearer ${session?.access_token ?? ""}` } });
         const payload = await response.json().catch(() => ({}));
         if (!response.ok) throw new Error(payload.error ?? "Host agent rejected the session.");
         if (active) {
           const state = payload as HostState;
           const minecraft: Service = { id: "minecraft", name: "Minecraft", kind: "Minecraft", state: state.minecraft.health === "healthy" ? "running" : "degraded", health: state.minecraft.health === "healthy" ? 100 : 0, cpu: -1, memory: -1, memoryLimit: 3072, port: state.minecraft.portJava, domain: undefined, uptime: formatUptime(state.host.uptimeSeconds), restarts: 0, boot: true, checkEvery: "live health", restartPolicy: "unless-stopped", dependencies: [], accent: "green", description: `Paper + Geyser · Java ${state.minecraft.portJava} · Bedrock ${state.minecraft.portBedrock}` };
-          const hostedServices: Service[] = state.services.filter(item => item.name !== "tmpserver-minecraft").map(item => ({ id: `website-${item.name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`, name: item.name, kind: item.kind ?? "Web app", state: item.status === "running" ? "running" : "stopped", health: item.status === "running" ? 100 : 0, cpu: -1, memory: -1, memoryLimit: 0, port: 443, domain: item.domain, uptime: "—", restarts: 0, boot: true, checkEvery: "Caddy route", restartPolicy: "always", dependencies: ["caddy"], accent: item.status === "running" ? "green" : "slate", description: item.domain ? `Static site · ${item.domain}` : "Managed website" }));
+          const hostedServices: Service[] = state.services.filter(item => item.kind !== "Minecraft").map(item => ({ id: `website-${item.name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`, name: item.name, kind: item.kind ?? "Web app", state: item.status === "running" ? "running" : "stopped", health: item.status === "running" ? 100 : 0, cpu: -1, memory: -1, memoryLimit: 0, port: 443, domain: item.domain, uptime: "—", restarts: 0, boot: true, checkEvery: "Caddy route", restartPolicy: "always", dependencies: ["caddy"], accent: item.status === "running" ? "green" : "slate", description: item.domain ? `Static site · ${item.domain}` : "Managed website" }));
           setHostState(state); setServices([minecraft, ...hostedServices]); setSelected(minecraft); setHostError("");
         }
       } catch (error) { if (active) setHostError(error instanceof Error ? error.message : "Unable to reach host agent."); }
@@ -304,7 +304,7 @@ function Home() {
     if (!hostApiUrl || !supabase) throw new Error("Live host agent is not configured.");
     const { data } = await supabase.auth.getSession();
     const headers = new Headers(init.headers); headers.set("Authorization", `Bearer ${data.session?.access_token ?? ""}`);
-    return fetch(`${hostApiUrl}${path}`, { ...init, headers });
+    return fetch(`${hostApiUrl}${path}`, { ...init, credentials: "include", headers });
   }
 
   async function loadCloudFiles() {
@@ -412,7 +412,7 @@ function Home() {
     setNotice(`${operation[0].toUpperCase()}${operation.slice(1)} request sent…`);
     try {
       const { data } = await supabase.auth.getSession();
-      const response = await fetch(`${hostApiUrl}/api/minecraft/lifecycle`, { method: "POST", headers: { "content-type": "application/json", Authorization: `Bearer ${data.session?.access_token ?? ""}` }, body: JSON.stringify({ action: operation }) });
+      const response = await fetch(`${hostApiUrl}/api/minecraft/lifecycle`, { method: "POST", credentials: "include", headers: { "content-type": "application/json", Authorization: `Bearer ${data.session?.access_token ?? ""}` }, body: JSON.stringify({ action: operation }) });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(payload.error ?? "Minecraft lifecycle request failed.");
       setHostState(payload.state as HostState); setNotice(`Minecraft ${operation} completed.`); setDrawer(null);
@@ -426,7 +426,7 @@ function Home() {
     setConsoleBusy(true); setConsoleError("");
     try {
       const { data } = await supabase.auth.getSession();
-      const response = await fetch(`${hostApiUrl}/api/minecraft/command`, { method: "POST", headers: { "content-type": "application/json", Authorization: `Bearer ${data.session?.access_token ?? ""}` }, body: JSON.stringify({ command }) });
+      const response = await fetch(`${hostApiUrl}/api/minecraft/command`, { method: "POST", credentials: "include", headers: { "content-type": "application/json", Authorization: `Bearer ${data.session?.access_token ?? ""}` }, body: JSON.stringify({ command }) });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(payload.error ?? "Console command failed.");
       setConsoleOutput(current => [...current, `$ ${command}`, payload.output || "(command accepted)"]); setConsoleCommand("");
@@ -480,9 +480,9 @@ function Home() {
 
   if (!authReady) return <div className="loading-screen"><div className="loading-orbit" /><span>Checking owner session…</span></div>;
   if (!supabaseConfigured) return <ConfigGate />;
-  if (!session || !isAllowedSession(session)) return <LoginGate session={session} onRefresh={() => setSession(null)} />;
+  if (!session || !isOwnerSession(session)) return <LoginGate session={session} onRefresh={() => setSession(null)} />;
   if (!hostApiUrl) return <HostUnavailable />;
-  if (!hostState) return <div className="loading-screen"><div className="loading-orbit" /><span>{hostError || "Connecting to live host…"}</span></div>;
+  if (!hostState) return hostError ? <div className="loading-screen"><span>Host agent unavailable: {hostError}</span><button className="button secondary" onClick={() => window.location.reload()}>Retry connection</button></div> : <div className="loading-screen"><div className="loading-orbit" /><span>Connecting to live host…</span></div>;
 
   return <div className="app-shell">
     <aside className={`sidebar ${sidebarOpen ? "open" : ""}`}>
