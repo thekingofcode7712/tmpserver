@@ -63,6 +63,27 @@ const staticPages = import.meta.env.VITE_STATIC_ONLY === "true";
 const hostApiUrl = ((import.meta.env.VITE_HOST_API_URL as string | undefined)?.trim() ?? "").replace(/\/+$/, "");
 
 type NavKey = "overview" | "services" | "nodes" | "logs" | "alerts" | "websites" | "cloud" | "settings";
+type SimulatedWebsiteStatus = "running" | "updating" | "down" | "maintenance" | "unknown";
+type HomepageService = Service & { externalUrl?: string; manualStatus?: SimulatedWebsiteStatus };
+const SITE_SIMULATION_KEY = "tmpserver-site-simulation-statuses";
+const SITE_SIMULATION_OPTIONS: { value: SimulatedWebsiteStatus; label: string }[] = [
+  { value: "running", label: "Running" },
+  { value: "updating", label: "Updating" },
+  { value: "down", label: "Down" },
+  { value: "maintenance", label: "Maintenance" },
+  { value: "unknown", label: "Unknown" },
+];
+function loadSiteSimulationStatuses(): Record<string, SimulatedWebsiteStatus> {
+  try {
+    if (typeof window === "undefined") return {};
+    const parsed: unknown = JSON.parse(window.localStorage.getItem(SITE_SIMULATION_KEY) ?? "{}");
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const valid = new Set(SITE_SIMULATION_OPTIONS.map(option => option.value));
+    return Object.fromEntries(Object.entries(parsed).filter(([slug, status]) => /^[a-z0-9-]{1,48}$/.test(slug) && valid.has(status as SimulatedWebsiteStatus))) as Record<string, SimulatedWebsiteStatus>;
+  } catch {
+    return {};
+  }
+}
 
 const navItems: { id: NavKey; label: string; icon: typeof LayoutDashboard; count?: string }[] = [
   { id: "overview", label: "Overview", icon: LayoutDashboard },
@@ -80,7 +101,8 @@ function Logo() {
 }
 
 function formatBytes(bytes: number) {
-  if (!Number.isFinite(bytes) || bytes <= 0) return "—";
+  if (!Number.isFinite(bytes) || bytes < 0) return "—";
+  if (bytes === 0) return "0 B";
   const units = ["B", "KB", "MB", "GB", "TB"];
   const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
   return `${(bytes / 1024 ** index).toFixed(index > 1 ? 1 : 0)} ${units[index]}`;
@@ -211,17 +233,59 @@ function HostUnavailable() {
   </div></div>;
 }
 
-function CloudPanel({ files, usedBytes, busy, error, onUpload, onBackup, onDownload, onDelete }: { files: CloudFile[]; usedBytes: number; busy: boolean; error: string; onUpload: (file: File) => void; onBackup: () => void; onDownload: (file: CloudFile) => void; onDelete: (file: CloudFile) => void }) {
-  return <section className="cloud-page"><div className="cloud-hero"><div><p className="eyebrow">PRIVATE VM STORAGE</p><h2>Cloud files</h2><p>Persistent files stored on the connected Ubuntu VM at <code>/opt/tmpserver/cloud</code>. Only authenticated TMP operators can access them.</p><p className="route-help"><strong>Minecraft backup:</strong> <code>minecraft-latest.tar.gz</code> is overwritten before controlled stop/restart/update actions and during VM shutdown.</p></div><div className="cloud-hero-actions"><button className="button secondary" onClick={onBackup} disabled={busy}><Archive size={15} /> {busy ? "Saving…" : "Back up Minecraft"}</button><label className="button primary upload-button"><Upload size={15} /> {busy ? "Uploading…" : "Upload file"}<input type="file" onChange={event => { const file = event.target.files?.[0]; if (file) onUpload(file); event.currentTarget.value = ""; }} disabled={busy} /></label></div></div>{error && <p className="form-error">{error}</p>}<div className="cloud-stats"><div><span>FILES</span><b>{files.length}</b></div><div><span>USED</span><b>{formatBytes(usedBytes)}</b></div><div><span>LIMIT / FILE</span><b>50 MB</b></div></div><div className="cloud-table"><div className="cloud-row cloud-head"><span>NAME</span><span>SIZE</span><span>MODIFIED</span><span /></div>{files.length ? files.map(file => <div className="cloud-row" key={file.path}><span className="cloud-name"><Archive size={15} />{file.path}</span><span>{formatBytes(file.size)}</span><span>{new Date(file.modified * 1000).toLocaleString()}</span><span className="cloud-actions"><button className="icon-button" title="Download" onClick={() => onDownload(file)}><Download size={15} /></button><button className="icon-button" title="Delete" onClick={() => onDelete(file)}><Trash2 size={15} /></button></span></div>) : <div className="cloud-empty"><Cloud size={22} /><p>No files stored yet. Upload your first file to the VM cloud.</p></div>}</div></section>;
+function CloudPanel({ files, usedBytes, availableBytes, busy, progress, error, onUpload, onBackup, onDownload, onDelete }: { files: CloudFile[]; usedBytes: number; availableBytes: number | null; busy: boolean; progress: number | null; error: string; onUpload: (file: File) => void; onBackup: () => void; onDownload: (file: CloudFile) => void; onDelete: (file: CloudFile) => void }) {
+  return <section className="cloud-page">
+    <div className="cloud-hero">
+      <div>
+        <p className="eyebrow">PRIVATE HOST STORAGE</p>
+        <h2>Cloud files</h2>
+        <p>Files are stored on the connected Linux host's persistent disk. Uploads are streamed in chunks, so the app does not impose a fixed per-file size cap.</p>
+        <p className="route-help"><strong>Capacity:</strong> limited by free disk space on the host and any network/proxy limits. This panel is host-disk storage, not a separate cloud-provider account.</p>
+        <p className="route-help"><strong>Minecraft backup:</strong> <code>minecraft-latest.tar.gz</code> is the rolling Cloud archive. Manual backups run as background host jobs; the optional systemd timer writes one daily at 09:00 UTC.</p>
+      </div>
+      <div className="cloud-hero-actions">
+        <button className="button secondary" onClick={onBackup} disabled={busy}><Archive size={15} /> {busy ? "Saving…" : "Back up Minecraft"}</button>
+        <label className="button primary upload-button"><Upload size={15} /> {busy ? (progress === null ? "Working…" : progress >= 100 ? "Finalizing…" : `Uploading ${progress}%`) : "Upload file"}<input type="file" onChange={event => { const file = event.target.files?.[0]; if (file) onUpload(file); event.currentTarget.value = ""; }} disabled={busy} /></label>
+      </div>
+    </div>
+    {error && <p className="form-error">{error}</p>}
+    {progress !== null && <div className="cloud-progress" aria-live="polite"><div><span>UPLOAD PROGRESS</span><b>{progress}%</b></div><progress max={100} value={progress} /></div>}
+    <div className="cloud-stats"><div><span>FILES</span><b>{files.length}</b></div><div><span>USED</span><b>{formatBytes(usedBytes)}</b></div><div><span>HOST FREE</span><b>{availableBytes === null ? "—" : formatBytes(availableBytes)}</b></div></div>
+    <div className="cloud-table"><div className="cloud-row cloud-head"><span>NAME</span><span>SIZE</span><span>MODIFIED</span><span /></div>{files.length ? files.map(file => <div className="cloud-row" key={file.path}><span className="cloud-name"><Archive size={15} />{file.path}</span><span>{formatBytes(file.size)}</span><span>{new Date(file.modified * 1000).toLocaleString()}</span><span className="cloud-actions"><button className="icon-button" title="Download" onClick={() => onDownload(file)}><Download size={15} /></button><button className="icon-button" title="Delete" onClick={() => onDelete(file)}><Trash2 size={15} /></button></span></div>) : <div className="cloud-empty"><Cloud size={22} /><p>No files stored yet. Upload a file to the connected host.</p></div>}</div>
+  </section>;
 }
 
-function WebsitesPanel({ sites, busy, error, name, setName, domain, setDomain, onCreate, onDeploy, onLifecycle, onDelete }: { sites: Website[]; busy: boolean; error: string; name: string; setName: (value: string) => void; domain: string; setDomain: (value: string) => void; onCreate: (event: React.FormEvent) => void; onDeploy: (site: Website, file: File) => void; onLifecycle: (site: Website, action: "start" | "stop") => void; onDelete: (site: Website) => void }) {
-  return <section className="cloud-page"><div className="cloud-hero"><div><p className="eyebrow">STATIC WEBSITE HOSTING</p><h2>Websites</h2><p>Deploy static HTML/CSS/JS sites to the persistent Ubuntu VM. Caddy handles HTTPS and serves only authenticated operator-managed files.</p><p className="route-help"><strong>Safe scope:</strong> ZIP deployments must contain <code>index.html</code>. Node/PHP runtimes are not enabled by this panel yet.</p></div></div><form className="website-create" onSubmit={onCreate}><input value={name} onChange={event => setName(event.target.value)} placeholder="Site name" required /><input value={domain} onChange={event => setDomain(event.target.value)} placeholder="www.example.com" required /><button className="button primary" type="submit" disabled={busy}><Plus size={15} /> Create website</button></form>{error && <p className="form-error">{error}</p>}<div className="cloud-stats"><div><span>SITES</span><b>{sites.length}</b></div><div><span>ACTIVE</span><b>{sites.filter(site => site.active).length}</b></div><div><span>DEPLOYMENT</span><b>ZIP / 50 MB</b></div></div><div className="website-grid">{sites.length ? sites.map(site => <article className="website-card" key={site.slug}><div className="website-card-head"><div><p className="eyebrow">{site.active ? "ACTIVE" : "STOPPED"}</p><h3>{site.name}</h3></div><span className={`status-dot ${site.active ? "running" : "stopped"}`} /></div><p className="website-domain">{site.domain}</p><div className="website-meta"><span>{site.files} files</span><span>{formatBytes(site.bytes)}</span></div><div className="website-actions"><label className="button secondary upload-button"><Upload size={14} /> Deploy ZIP<input type="file" accept=".zip,application/zip" onChange={event => { const file = event.target.files?.[0]; if (file) onDeploy(site, file); event.currentTarget.value = ""; }} disabled={busy} /></label><button className="button secondary" onClick={() => onLifecycle(site, site.active ? "stop" : "start")} disabled={busy}>{site.active ? <Square size={14} /> : <Play size={14} />}{site.active ? "Stop" : "Start"}</button><button className="icon-button" title="Delete website" onClick={() => onDelete(site)} disabled={busy}><Trash2 size={15} /></button></div></article>) : <div className="cloud-empty"><Globe size={22} /><p>No websites yet. Create a site, point DNS at 140.238.70.11, then deploy a ZIP.</p></div>}</div></section>;
+function WebsitesPanel({ sites, busy, error, name, setName, kind, setKind, target, setTarget, simulationStatuses, progress, onSimulationStatus, onCreate, onDeploy, onLifecycle, onDelete }: { sites: Website[]; busy: boolean; error: string; name: string; setName: (value: string) => void; kind: "hosted" | "external"; setKind: (value: "hosted" | "external") => void; target: string; setTarget: (value: string) => void; simulationStatuses: Record<string, SimulatedWebsiteStatus>; progress: number | null; onSimulationStatus: (slug: string, status: SimulatedWebsiteStatus) => void; onCreate: (event: React.FormEvent) => void; onDeploy: (site: Website, file: File) => void; onLifecycle: (site: Website, action: "start" | "stop") => void; onDelete: (site: Website) => void }) {
+  const hostedSites = sites.filter(site => site.kind !== "external");
+  const externalSites = sites.filter(site => site.kind === "external");
+  return <section className="cloud-page">
+    <div className="cloud-hero"><div><p className="eyebrow">SITE DIRECTORY / HOSTING</p><h2>Websites & links</h2><p>Add any website to your private directory, whether it is hosted on this server or somewhere else. External links are saved here only; they do not change DNS, proxy routes, or server hosting.</p><p className="route-help"><strong>Hosted here:</strong> Static HTML/CSS/JS sites use Caddy and require a domain plus a ZIP containing <code>index.html</code>. ZIP uploads use the same chunked transfer and have no fixed application size cap; deployment requires enough host disk space to extract the site safely. <strong>External link:</strong> Save any absolute HTTP or HTTPS URL—no server routing required. External link status is manual and saved in this browser. It does not monitor or control the linked site.</p></div></div>
+    <form className="website-create" onSubmit={onCreate}>
+      <input value={name} onChange={event => setName(event.target.value)} placeholder="Site name" aria-label="Site name" required />
+      <select value={kind} onChange={event => setKind(event.target.value as "hosted" | "external")} aria-label="Site type"><option value="hosted">Hosted on this server</option><option value="external">External site link</option></select>
+      <input type={kind === "external" ? "url" : "text"} value={target} onChange={event => setTarget(event.target.value)} placeholder={kind === "external" ? "https://example.com" : "www.example.com"} aria-label={kind === "external" ? "External site URL" : "Hosted site domain"} required />
+      <button className="button primary" type="submit" disabled={busy}><Plus size={15} /> {kind === "external" ? "Add link" : "Create hosted site"}</button>
+    </form>
+    {progress !== null && <div className="cloud-progress" aria-live="polite"><div><span>ZIP DEPLOY PROGRESS</span><b>{progress}%</b></div><progress max={100} value={progress} /></div>}
+    {error && <p className="form-error">{error}</p>}
+    <div className="cloud-stats"><div><span>TOTAL ENTRIES</span><b>{sites.length}</b></div><div><span>HOSTED HERE</span><b>{hostedSites.length}</b></div><div><span>EXTERNAL LINKS</span><b>{externalSites.length}</b></div></div>
+    <div className="website-grid">{sites.length ? sites.map(site => {
+      const external = site.kind === "external";
+      const simulatedStatus = simulationStatuses[site.slug] ?? "unknown";
+      return <article className={`website-card ${external ? "external-site-card" : ""}`} key={site.slug}>
+        <div className="website-card-head"><div><p className="eyebrow">{external ? "EXTERNAL LINK" : site.active ? "ACTIVE · HOSTED HERE" : "STOPPED · HOSTED HERE"}</p><h3>{site.name}</h3></div>{!external && <span className={`status-dot ${site.active ? "running" : "stopped"}`} />}</div>
+        {external ? <a className="website-link" href={site.url} target="_blank" rel="noopener noreferrer">{site.url}<ArrowUpRight size={14} /></a> : <p className="website-domain">{site.domain}</p>}
+        <div className="website-meta">{external ? <><span>Not hosted on this server</span><span>HTTP(S) link</span></> : <><span>{site.files} files</span><span>{formatBytes(site.bytes)}</span></>}</div>
+        {external && <div className="website-simulation"><span className={`sim-status ${simulatedStatus}`}>MANUAL · {simulatedStatus.toUpperCase()}</span><label>Status<select value={simulatedStatus} onChange={event => onSimulationStatus(site.slug, event.target.value as SimulatedWebsiteStatus)} aria-label={`Manual status for ${site.name}`}>{SITE_SIMULATION_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label><small>Manual browser status · no live monitoring or server action</small></div>}
+        <div className="website-actions">{external ? <><a className="button secondary" href={site.url} target="_blank" rel="noopener noreferrer"><ArrowUpRight size={14} /> Open site</a><button type="button" className="icon-button" title="Remove external link" aria-label={`Remove external link ${site.name}`} onClick={() => onDelete(site)} disabled={busy}><Trash2 size={15} /></button></> : <><label className="button secondary upload-button"><Upload size={14} /> {progress === null ? "Deploy ZIP" : `Deploy ZIP ${progress}%`}<input type="file" accept=".zip,application/zip" onChange={event => { const file = event.target.files?.[0]; if (file) onDeploy(site, file); event.currentTarget.value = ""; }} disabled={busy} /></label><button className="button secondary" onClick={() => onLifecycle(site, site.active ? "stop" : "start")} disabled={busy}>{site.active ? <Square size={14} /> : <Play size={14} />}{site.active ? "Stop" : "Start"}</button><button type="button" className="icon-button" title="Delete hosted website and files" aria-label={`Delete hosted website ${site.name}`} onClick={() => onDelete(site)} disabled={busy}><Trash2 size={15} /></button></>}</div>
+      </article>;
+    }) : <div className="cloud-empty"><Globe size={22} /><p>Add a hosted website or an external link. Links do not need to be routed through this server.</p></div>}</div>
+  </section>;
 }
 
-function SettingsPanel({ settings, viewDistance, setViewDistance, simulationDistance, setSimulationDistance, maxPlayers, setMaxPlayers, busy, error, onSaveMinecraft, onBackup, onRefresh }: { settings: SettingsSnapshot | null; viewDistance: string; setViewDistance: (value: string) => void; simulationDistance: string; setSimulationDistance: (value: string) => void; maxPlayers: string; setMaxPlayers: (value: string) => void; busy: boolean; error: string; onSaveMinecraft: (event: React.FormEvent) => void; onBackup: () => void; onRefresh: () => void }) {
+function SettingsPanel({ settings, viewDistance, setViewDistance, simulationDistance, setSimulationDistance, maxPlayers, setMaxPlayers, whitelist, setWhitelist, busy, error, onSaveMinecraft, onBackup, onRefresh }: { settings: SettingsSnapshot | null; viewDistance: string; setViewDistance: (value: string) => void; simulationDistance: string; setSimulationDistance: (value: string) => void; maxPlayers: string; setMaxPlayers: (value: string) => void; whitelist: boolean; setWhitelist: (value: boolean) => void; busy: boolean; error: string; onSaveMinecraft: (event: React.FormEvent) => void; onBackup: () => void; onRefresh: () => void }) {
   if (!settings) return <div className="loading-screen"><div className="loading-orbit" /><span>Loading live settings…</span></div>;
-  return <section className="settings-page"><div className="cloud-hero"><div><p className="eyebrow">DATACENTER / NODE CONFIGURATION</p><h2>Settings</h2><p>Live administration for the connected VM. Values below are read from the Ubuntu host and protected by the Supabase access policy.</p></div><button className="button secondary" onClick={onRefresh} disabled={busy}><RefreshCw size={15} /> Refresh live values</button></div>{error && <p className="form-error">{error}</p>}<div className="settings-grid"><div className="panel settings-card"><div className="panel-header compact"><div><p className="eyebrow">NODE IDENTITY</p><h2>{settings.host.hostname}</h2></div><span className="online-pill"><span /> {settings.agent.status}</span></div><div className="settings-list"><div><span>OPERATING SYSTEM</span><b>{settings.host.os}</b></div><div><span>ARCHITECTURE</span><b>{settings.host.architecture}</b></div><div><span>HOST UPTIME</span><b>{formatUptime(settings.host.uptimeSeconds)}</b></div><div><span>AGENT UPTIME</span><b>{formatUptime(settings.agent.uptimeSeconds)}</b></div></div></div><div className="panel settings-card"><div className="panel-header compact"><div><p className="eyebrow">ACCESS CONTROL</p><h2>Supabase policy</h2></div><ShieldCheck size={17} className="settings-icon" /></div><div className="settings-list"><div><span>SESSION</span><b>Authenticated</b></div><div><span>ROLE</span><b>{settings.permissions.owner ? "Owner" : "Invited member"}</b></div><div><span>PUBLIC REGISTRATION</span><b>Disabled</b></div><div><span>HOST MUTATIONS</span><b>{settings.permissions.owner ? "Owner enabled" : "Read-only"}</b></div></div></div></div><div className="panel settings-card"><div className="panel-header compact"><div><p className="eyebrow">MINECRAFT / PAPER</p><h2>Runtime configuration</h2></div><Box size={17} className="settings-icon" /></div><form className="settings-form" onSubmit={onSaveMinecraft}><label className="field-label">View distance <span className="field-help">2–32 chunks</span><input type="number" min="2" max="32" value={viewDistance} onChange={event => setViewDistance(event.target.value)} disabled={!settings.permissions.owner || busy} /></label><label className="field-label">Simulation distance <span className="field-help">2–32 chunks</span><input type="number" min="2" max="32" value={simulationDistance} onChange={event => setSimulationDistance(event.target.value)} disabled={!settings.permissions.owner || busy} /></label><label className="field-label">Maximum players <span className="field-help">1–1000</span><input type="number" min="1" max="1000" value={maxPlayers} onChange={event => setMaxPlayers(event.target.value)} disabled={!settings.permissions.owner || busy} /></label><div className="settings-readonly"><span>WHITELIST ENFORCEMENT</span><b>{settings.minecraft.whitelist ? "Enabled" : "Disabled"}</b></div><button className="button primary" type="submit" disabled={!settings.permissions.owner || busy}><SaveIcon size={15} /> {busy ? "Applying safely…" : "Save and restart Minecraft"}</button></form><p className="route-help">Saving stops the server, confirms a rolling backup, updates Compose, and restarts Paper. The change is rejected if the backup fails.</p></div><div className="panel settings-card"><div className="panel-header compact"><div><p className="eyebrow">BACKUPS / RECOVERY</p><h2>Cloud protection</h2></div><Archive size={17} className="settings-icon" /></div><div className="settings-list"><div><span>ROLLING BACKUP</span><b>{settings.backup.present ? "Available" : "Not created"}</b></div><div><span>BACKUP SIZE</span><b>{settings.backup.present ? formatBytes(settings.backup.bytes) : "—"}</b></div><div><span>LOCATION</span><b>/opt/tmpserver/cloud</b></div></div><button className="button secondary full" onClick={onBackup} disabled={busy}><Archive size={15} /> Create backup now</button></div><div className="panel settings-card infrastructure-card"><div className="panel-header compact"><div><p className="eyebrow">NODE INFRASTRUCTURE</p><h2>VM-backed capabilities</h2></div><Server size={17} className="settings-icon" /></div><div className="capability-grid"><div><span>DOCKER</span><b>{settings.admin.capabilities.docker ? `Active · ${settings.admin.docker.version}` : "Unavailable"}</b><small>{settings.admin.docker.cpus} CPUs · {formatBytes(settings.admin.docker.memoryBytes)} RAM</small></div><div><span>STORAGE</span><b>{settings.admin.storage[0] ? `${settings.admin.storage[0].usedPercent}% used` : "Unavailable"}</b><small>{settings.admin.storage[0] ? `${formatBytes(settings.admin.storage[0].freeBytes)} free · ${settings.admin.storage[0].mount}` : "No mount data"}</small></div><div><span>UFW FIREWALL</span><b>{settings.admin.firewall.active ? "Active · default deny" : "Inactive"}</b><small>{settings.admin.firewall.rules.length} visible rules</small></div><div><span>NATIVE VMS</span><b>{settings.admin.capabilities.nativeVmManagement ? "Available" : "Unavailable"}</b><small>{settings.admin.capabilities.kvm ? "/dev/kvm detected" : "Oracle VM has no /dev/kvm"}</small></div></div>{settings.admin.failedUnits.length ? <p className="form-error">Failed systemd units: {settings.admin.failedUnits.join(", ")}</p> : <p className="route-help"><ShieldCheck size={13} /> No failed systemd units reported. Docker is the active workload layer; native KVM VM management remains unavailable on this host.</p>}</div></section>;
+  return <section className="settings-page"><div className="cloud-hero"><div><p className="eyebrow">DATACENTER / NODE CONFIGURATION</p><h2>Settings</h2><p>Live administration for the connected Linux host. Values below are read from the host agent and protected by the Supabase access policy.</p></div><button className="button secondary" onClick={onRefresh} disabled={busy}><RefreshCw size={15} /> Refresh live values</button></div>{error && <p className="form-error">{error}</p>}<div className="settings-grid"><div className="panel settings-card"><div className="panel-header compact"><div><p className="eyebrow">NODE IDENTITY</p><h2>{settings.host.hostname}</h2></div><span className="online-pill"><span /> {settings.agent.status}</span></div><div className="settings-list"><div><span>OPERATING SYSTEM</span><b>{settings.host.os}</b></div><div><span>ARCHITECTURE</span><b>{settings.host.architecture}</b></div><div><span>HOST UPTIME</span><b>{formatUptime(settings.host.uptimeSeconds)}</b></div><div><span>AGENT UPTIME</span><b>{formatUptime(settings.agent.uptimeSeconds)}</b></div></div></div><div className="panel settings-card"><div className="panel-header compact"><div><p className="eyebrow">ACCESS CONTROL</p><h2>Supabase policy</h2></div><ShieldCheck size={17} className="settings-icon" /></div><div className="settings-list"><div><span>SESSION</span><b>Authenticated</b></div><div><span>ROLE</span><b>{settings.permissions.owner ? "Owner" : "Invited member"}</b></div><div><span>PUBLIC REGISTRATION</span><b>Disabled</b></div><div><span>HOST MUTATIONS</span><b>{settings.permissions.owner ? "Owner enabled" : "Read-only"}</b></div></div></div></div><div className="panel settings-card"><div className="panel-header compact"><div><p className="eyebrow">MINECRAFT / PAPER</p><h2>Runtime configuration</h2></div><Box size={17} className="settings-icon" /></div><form className="settings-form" onSubmit={onSaveMinecraft}><label className="field-label">View distance <span className="field-help">2–32 chunks</span><input type="number" min="2" max="32" step="1" required value={viewDistance} onChange={event => setViewDistance(event.target.value)} disabled={!settings.permissions.owner || busy} /></label><label className="field-label">Simulation distance <span className="field-help">2–32 chunks</span><input type="number" min="2" max="32" step="1" required value={simulationDistance} onChange={event => setSimulationDistance(event.target.value)} disabled={!settings.permissions.owner || busy} /></label><label className="field-label">Maximum players <span className="field-help">1–1000</span><input type="number" min="1" max="1000" step="1" required value={maxPlayers} onChange={event => setMaxPlayers(event.target.value)} disabled={!settings.permissions.owner || busy} /></label><label className="settings-checkbox"><input type="checkbox" checked={whitelist} onChange={event => setWhitelist(event.target.checked)} disabled={!settings.permissions.owner || busy} /><span><b>Enable whitelist enforcement</b><small>Only players on the Minecraft whitelist can join when this is enabled.</small></span></label><button className="button primary" type="submit" disabled={!settings.permissions.owner || busy}><SaveIcon size={15} /> {busy ? "Applying safely…" : "Save and restart Minecraft"}</button></form><p className="route-help">The host validates every value before changes, creates the backup while Paper is running, and only then stops, updates Compose, and restarts the server. Backup or restart failures are shown here.</p></div><div className="panel settings-card"><div className="panel-header compact"><div><p className="eyebrow">BACKUPS / RECOVERY</p><h2>Cloud protection</h2></div><Archive size={17} className="settings-icon" /></div><div className="settings-list"><div><span>ROLLING BACKUP</span><b>{settings.backup.present ? "Available" : "Not created"}</b></div><div><span>BACKUP SIZE</span><b>{settings.backup.present ? formatBytes(settings.backup.bytes) : "—"}</b></div><div><span>LOCATION</span><b>Configured host storage</b></div></div><button className="button secondary full" onClick={onBackup} disabled={busy}><Archive size={15} /> Create backup now</button></div><div className="panel settings-card infrastructure-card"><div className="panel-header compact"><div><p className="eyebrow">NODE INFRASTRUCTURE</p><h2>VM-backed capabilities</h2></div><Server size={17} className="settings-icon" /></div><div className="capability-grid"><div><span>DOCKER</span><b>{settings.admin.capabilities.docker ? `Active · ${settings.admin.docker.version}` : "Unavailable"}</b><small>{settings.admin.docker.cpus} CPUs · {formatBytes(settings.admin.docker.memoryBytes)} RAM</small></div><div><span>STORAGE</span><b>{settings.admin.storage[0] ? `${settings.admin.storage[0].usedPercent}% used` : "Unavailable"}</b><small>{settings.admin.storage[0] ? `${formatBytes(settings.admin.storage[0].freeBytes)} free · ${settings.admin.storage[0].mount}` : "No mount data"}</small></div><div><span>UFW FIREWALL</span><b>{settings.admin.firewall.active ? "Active · default deny" : "Inactive"}</b><small>{settings.admin.firewall.rules.length} visible rules</small></div><div><span>NATIVE VMS</span><b>{settings.admin.capabilities.nativeVmManagement ? "Available" : "Unavailable"}</b><small>{settings.admin.capabilities.kvm ? "/dev/kvm detected" : "Oracle VM has no /dev/kvm"}</small></div></div>{settings.admin.failedUnits.length ? <p className="form-error">Failed systemd units: {settings.admin.failedUnits.join(", ")}</p> : <p className="route-help"><ShieldCheck size={13} /> No failed systemd units reported. Docker is the active workload layer; native KVM VM management remains unavailable on this host.</p>}</div></section>;
 }
 
 function MinecraftConsole({ command, setCommand, output, busy, error, onClose, onSubmit }: { command: string; setCommand: (value: string) => void; output: string[]; busy: boolean; error: string; onClose: () => void; onSubmit: (event: React.FormEvent) => void }) {
@@ -256,17 +320,23 @@ function Home() {
   const [consoleError, setConsoleError] = useState("");
   const [cloudFiles, setCloudFiles] = useState<CloudFile[]>([]);
   const [cloudUsedBytes, setCloudUsedBytes] = useState(0);
+  const [cloudAvailableBytes, setCloudAvailableBytes] = useState<number | null>(null);
+  const [cloudProgress, setCloudProgress] = useState<number | null>(null);
   const [cloudBusy, setCloudBusy] = useState(false);
   const [cloudError, setCloudError] = useState("");
   const [websites, setWebsites] = useState<Website[]>([]);
   const [websiteName, setWebsiteName] = useState("");
+  const [siteSimulationStatuses, setSiteSimulationStatuses] = useState<Record<string, SimulatedWebsiteStatus>>(loadSiteSimulationStatuses);
+  const [websiteKind, setWebsiteKind] = useState<"hosted" | "external">("hosted");
   const [websiteDomain, setWebsiteDomain] = useState("");
   const [websiteBusy, setWebsiteBusy] = useState(false);
+  const [websiteProgress, setWebsiteProgress] = useState<number | null>(null);
   const [websiteError, setWebsiteError] = useState("");
   const [settings, setSettings] = useState<SettingsSnapshot | null>(null);
   const [settingsViewDistance, setSettingsViewDistance] = useState("32");
   const [settingsSimulationDistance, setSettingsSimulationDistance] = useState("16");
   const [settingsMaxPlayers, setSettingsMaxPlayers] = useState("1000");
+  const [settingsWhitelist, setSettingsWhitelist] = useState(false);
   const [settingsBusy, setSettingsBusy] = useState(false);
   const [settingsError, setSettingsError] = useState("");
 
@@ -278,6 +348,7 @@ function Home() {
   }, []);
 
   useEffect(() => { if (notice) { const timer = window.setTimeout(() => setNotice(""), 3400); return () => window.clearTimeout(timer); } }, [notice]);
+  useEffect(() => { try { window.localStorage.setItem(SITE_SIMULATION_KEY, JSON.stringify(siteSimulationStatuses)); } catch { /* Local persistence is optional. */ } }, [siteSimulationStatuses]);
 
   useEffect(() => {
     if (!hostApiUrl || !session) return;
@@ -308,55 +379,112 @@ function Home() {
   }
 
   async function loadCloudFiles() {
-    try { const response = await cloudRequest("/api/cloud/files"); const payload = await response.json(); if (!response.ok) throw new Error(payload.error ?? "Could not load cloud files."); setCloudFiles(payload.files ?? []); setCloudUsedBytes(payload.usedBytes ?? 0); setCloudError(""); }
+    try { const response = await cloudRequest("/api/cloud/files"); const payload = await response.json(); if (!response.ok) throw new Error(payload.error ?? "Could not load cloud files."); setCloudFiles(payload.files ?? []); setCloudUsedBytes(payload.usedBytes ?? 0); setCloudAvailableBytes(typeof payload.availableBytes === "number" ? payload.availableBytes : null); setCloudError(""); }
     catch (error) { setCloudError(error instanceof Error ? error.message : "Could not load cloud files."); }
   }
 
   useEffect(() => { if (session && hostApiUrl) void loadCloudFiles(); }, [session]);
 
-  async function loadWebsites() {
-    try { const response = await cloudRequest("/api/websites"); const payload = await response.json(); if (!response.ok) throw new Error(payload.error ?? "Could not load websites."); setWebsites(payload.sites ?? []); setWebsiteError(""); }
-    catch (error) { setWebsiteError(error instanceof Error ? error.message : "Could not load websites."); }
+  async function loadWebsites(): Promise<boolean> {
+    try { const response = await cloudRequest("/api/websites"); const payload = await response.json(); if (!response.ok) throw new Error(payload.error ?? "Could not load websites."); setWebsites(payload.sites ?? []); setWebsiteError(""); return true; }
+    catch (error) { setWebsiteError(error instanceof Error ? error.message : "Could not load websites."); return false; }
   }
 
   useEffect(() => { if (session && hostApiUrl) void loadWebsites(); }, [session]);
 
-  async function loadSettings() {
-    try { const response = await cloudRequest("/api/settings"); const payload = await response.json(); if (!response.ok) throw new Error(payload.error ?? "Could not load live settings."); const next = payload as SettingsSnapshot; setSettings(next); setSettingsViewDistance(String(next.minecraft.viewDistance)); setSettingsSimulationDistance(String(next.minecraft.simulationDistance)); setSettingsMaxPlayers(String(next.minecraft.maxPlayers)); setSettingsError(""); }
-    catch (error) { setSettingsError(error instanceof Error ? error.message : "Could not load live settings."); }
+  async function loadSettings(): Promise<boolean> {
+    try { const response = await cloudRequest("/api/settings"); const payload = await response.json(); if (!response.ok) throw new Error(payload.error ?? "Could not load live settings."); const next = payload as SettingsSnapshot; setSettings(next); setSettingsViewDistance(String(next.minecraft.viewDistance)); setSettingsSimulationDistance(String(next.minecraft.simulationDistance)); setSettingsMaxPlayers(String(next.minecraft.maxPlayers)); setSettingsWhitelist(next.minecraft.whitelist); setSettingsError(""); return true; }
+    catch (error) { setSettingsError(error instanceof Error ? error.message : "Could not load live settings."); return false; }
   }
 
   useEffect(() => { if (session && hostApiUrl) void loadSettings(); }, [session]);
 
+  async function waitForMinecraftJob(jobId: string) {
+    const deadline = Date.now() + 6 * 60 * 60 * 1000 + 15 * 60 * 1000;
+    while (Date.now() < deadline) {
+      await new Promise<void>(resolve => window.setTimeout(resolve, 5000));
+      const response = await cloudRequest(`/api/minecraft/jobs/${jobId}`);
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.error ?? "Could not check Minecraft operation status.");
+      if (payload.status === "succeeded") return payload.result ?? {};
+      if (payload.status === "failed") throw new Error(payload.error ?? "Minecraft operation failed.");
+      if (payload.status !== "running") throw new Error("The host returned an unknown Minecraft operation status.");
+    }
+    throw new Error("The Minecraft operation exceeded its 6-hour safety window. The host backup wrapper sends TERM and allows cleanup; check the host service logs and verify world saving before retrying.");
+  }
+
+  async function awaitMinecraftJob(response: Response, action: string) {
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.error ?? `${action} failed.`);
+    const jobId = String(payload.jobId ?? "");
+    if (!jobId) return payload; // Compatibility with an already-completed response from an older agent.
+    if (!/^[a-f0-9]{32}$/.test(jobId)) throw new Error("The host returned an invalid Minecraft job ID.");
+    return waitForMinecraftJob(jobId);
+  }
+
   async function saveMinecraftSettings(event: React.FormEvent) {
     event.preventDefault(); if (!settings?.permissions.owner) return;
-    if (!window.confirm("Save these Minecraft settings? The server will stop, back up the world, and restart.")) return;
+    if (!window.confirm("Apply these Minecraft settings? The host will validate them, back up the world while Paper is running, then stop and restart the server.")) return;
     setSettingsBusy(true); setSettingsError("");
-    try { const response = await cloudRequest("/api/minecraft/settings", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ viewDistance: Number(settingsViewDistance), simulationDistance: Number(settingsSimulationDistance), maxPlayers: Number(settingsMaxPlayers) }) }); const payload = await response.json(); if (!response.ok) throw new Error(payload.error ?? "Minecraft settings update failed."); await loadSettings(); if (payload.state) setHostState(payload.state as HostState); setNotice("Minecraft settings saved and server restarted safely."); }
-    catch (error) { setSettingsError(error instanceof Error ? error.message : "Minecraft settings update failed."); }
+    try {
+      const response = await cloudRequest("/api/minecraft/settings", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ viewDistance: Number(settingsViewDistance), simulationDistance: Number(settingsSimulationDistance), maxPlayers: Number(settingsMaxPlayers), whitelist: settingsWhitelist }) });
+      await awaitMinecraftJob(response, "Minecraft settings update");
+      if (!await loadSettings()) throw new Error("Minecraft restarted, but the dashboard could not refresh the applied settings.");
+      setNotice("Minecraft settings saved and the server restarted.");
+    } catch (error) { setSettingsError(error instanceof Error ? error.message : "Minecraft settings update failed."); }
     finally { setSettingsBusy(false); }
+  }
+
+  async function startAndWaitForBackup() {
+    const response = await cloudRequest("/api/minecraft/backup", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    return awaitMinecraftJob(response, "Minecraft backup");
   }
 
   async function backupFromSettings() {
     setSettingsBusy(true); setSettingsError("");
-    try { const response = await cloudRequest("/api/minecraft/backup", { method: "POST", headers: { "content-type": "application/json" } }); const payload = await response.json().catch(() => ({})); if (!response.ok) throw new Error(payload.error ?? "Minecraft backup failed."); await loadSettings(); await loadCloudFiles(); setNotice("Minecraft backup created in Cloud."); }
+    try { await startAndWaitForBackup(); if (!await loadSettings()) throw new Error("Backup completed, but backup metadata could not be refreshed."); await loadCloudFiles(); setNotice("Minecraft backup created in Cloud."); }
     catch (error) { setSettingsError(error instanceof Error ? error.message : "Minecraft backup failed."); }
     finally { setSettingsBusy(false); }
   }
 
   async function createWebsite(event: React.FormEvent) {
     event.preventDefault(); setWebsiteBusy(true); setWebsiteError("");
-    try { const response = await cloudRequest("/api/websites", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: websiteName, domain: websiteDomain }) }); const payload = await response.json(); if (!response.ok) throw new Error(payload.error ?? "Could not create website."); setWebsiteName(""); setWebsiteDomain(""); await loadWebsites(); setNotice(`Website ${payload.site.name} created.`); }
+    try { const details = websiteKind === "external" ? { url: websiteDomain } : { domain: websiteDomain }; const response = await cloudRequest("/api/websites", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: websiteName, kind: websiteKind, ...details }) }); const payload = await response.json(); if (!response.ok) throw new Error(payload.error ?? "Could not create site entry."); setWebsiteName(""); setWebsiteDomain(""); setNotice(websiteKind === "external" ? `Link ${payload.site.name} added.` : `Website ${payload.site.name} created.`); await loadWebsites(); }
     catch (error) { setWebsiteError(error instanceof Error ? error.message : "Could not create website."); }
     finally { setWebsiteBusy(false); }
   }
 
   async function deployWebsite(site: Website, file: File) {
     if (!file.name.toLowerCase().endsWith(".zip")) { setWebsiteError("Choose a ZIP file."); return; }
-    setWebsiteBusy(true); setWebsiteError("");
-    try { const form = new FormData(); form.append("file", file); const response = await cloudRequest(`/api/websites/${site.slug}/deploy`, { method: "POST", body: form }); const payload = await response.json(); if (!response.ok) throw new Error(payload.error ?? "Website deployment failed."); await loadWebsites(); setNotice(`${site.name} deployed.`); }
-    catch (error) { setWebsiteError(error instanceof Error ? error.message : "Website deployment failed."); }
-    finally { setWebsiteBusy(false); }
+    setWebsiteBusy(true); setWebsiteError(""); setWebsiteProgress(0);
+    let uploadId: string | null = null;
+    try {
+      const startResponse = await cloudRequest(`/api/websites/${site.slug}/deploy/start`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ size: file.size }) });
+      const startPayload = await startResponse.json().catch(() => ({}));
+      if (!startResponse.ok) throw new Error(startPayload.error ?? "Could not start ZIP upload.");
+      uploadId = String(startPayload.uploadId ?? "");
+      const chunkSize = Number(startPayload.chunkSize);
+      const totalChunks = Number(startPayload.totalChunks);
+      if (!/^[a-f0-9]{32}$/.test(uploadId) || !Number.isSafeInteger(chunkSize) || chunkSize < 1 || !Number.isSafeInteger(totalChunks) || totalChunks < 0) throw new Error("The host returned an invalid ZIP upload session.");
+      for (let index = 0; index < totalChunks; index += 1) {
+        const start = index * chunkSize;
+        const chunk = file.slice(start, Math.min(start + chunkSize, file.size));
+        const response = await cloudRequest(`/api/cloud/uploads/${uploadId}/chunk/${index}`, { method: "POST", headers: { "content-type": "application/octet-stream" }, body: chunk });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(payload.error ?? `ZIP upload chunk ${index + 1} failed.`);
+        setWebsiteProgress(file.size ? Math.floor(Math.min(file.size, start + chunk.size) / file.size * 100) : 100);
+      }
+      setWebsiteProgress(100);
+      const finishResponse = await cloudRequest(`/api/cloud/uploads/${uploadId}/finish`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+      const finishPayload = await finishResponse.json().catch(() => ({}));
+      if (!finishResponse.ok) throw new Error(finishPayload.error ?? "Website deployment failed.");
+      uploadId = null;
+      await loadWebsites();
+      setNotice(`${site.name} deployed.`);
+    } catch (error) {
+      if (uploadId) void cloudRequest(`/api/cloud/uploads/${uploadId}/abort`, { method: "POST" }).catch(() => undefined);
+      setWebsiteError(error instanceof Error ? error.message : "Website deployment failed.");
+    } finally { setWebsiteBusy(false); setWebsiteProgress(null); }
   }
 
   async function websiteLifecycle(site: Website, action: "start" | "stop") {
@@ -367,26 +495,49 @@ function Home() {
   }
 
   async function deleteWebsite(site: Website) {
-    if (!window.confirm(`Delete ${site.name} and all deployed files?`)) return;
+    if (!window.confirm(site.kind === "external" ? `Remove the external link ${site.name}?` : `Delete ${site.name} and all deployed files?`)) return;
     setWebsiteBusy(true); setWebsiteError("");
-    try { const response = await cloudRequest(`/api/websites/${site.slug}/delete`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }); const payload = await response.json(); if (!response.ok) throw new Error(payload.error ?? "Website deletion failed."); await loadWebsites(); setNotice(`${site.name} deleted.`); }
+    try { const response = await cloudRequest(`/api/websites/${site.slug}/delete`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }); const payload = await response.json(); if (!response.ok) throw new Error(payload.detail ? `${payload.error ?? "Website deletion failed."} ${payload.detail}` : payload.error ?? "Website deletion failed."); if (!await loadWebsites()) throw new Error("Website was deleted, but the list could not be refreshed; use Refresh or reload the page."); setSiteSimulationStatuses(current => { const next = { ...current }; delete next[site.slug]; return next; }); if (payload.warning) setWebsiteError(String(payload.warning)); setNotice(`${site.name} deleted.`); }
     catch (error) { setWebsiteError(error instanceof Error ? error.message : "Website deletion failed."); }
     finally { setWebsiteBusy(false); }
   }
 
   async function uploadCloudFile(file: File) {
-    setCloudBusy(true); setCloudError("");
-    try { const form = new FormData(); form.append("path", file.name); form.append("file", file); const response = await cloudRequest("/api/cloud/upload", { method: "POST", body: form }); const payload = await response.json(); if (!response.ok) throw new Error(payload.error ?? "Upload failed."); await loadCloudFiles(); setNotice(`${file.name} uploaded to the VM cloud.`); }
-    catch (error) { setCloudError(error instanceof Error ? error.message : "Upload failed."); }
-    finally { setCloudBusy(false); }
+    setCloudBusy(true); setCloudError(""); setCloudProgress(0);
+    let uploadId: string | null = null;
+    try {
+      const startResponse = await cloudRequest("/api/cloud/upload/start", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ path: file.name, size: file.size }) });
+      const startPayload = await startResponse.json().catch(() => ({}));
+      if (!startResponse.ok) throw new Error(startPayload.error ?? "Could not start upload.");
+      uploadId = String(startPayload.uploadId ?? "");
+      const chunkSize = Number(startPayload.chunkSize);
+      const totalChunks = Number(startPayload.totalChunks);
+      if (!/^[a-f0-9]{32}$/.test(uploadId) || !Number.isSafeInteger(chunkSize) || chunkSize < 1 || !Number.isSafeInteger(totalChunks) || totalChunks < 0) throw new Error("The host returned an invalid upload session.");
+      for (let index = 0; index < totalChunks; index += 1) {
+        const start = index * chunkSize;
+        const chunk = file.slice(start, Math.min(start + chunkSize, file.size));
+        const response = await cloudRequest(`/api/cloud/uploads/${uploadId}/chunk/${index}`, { method: "POST", headers: { "content-type": "application/octet-stream" }, body: chunk });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(payload.error ?? `Upload chunk ${index + 1} failed.`);
+        setCloudProgress(file.size ? Math.floor(Math.min(file.size, start + chunk.size) / file.size * 100) : 100);
+      }
+      setCloudProgress(100);
+      const finishResponse = await cloudRequest(`/api/cloud/uploads/${uploadId}/finish`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+      const finishPayload = await finishResponse.json().catch(() => ({}));
+      if (!finishResponse.ok) throw new Error(finishPayload.error ?? "Could not finalize upload.");
+      uploadId = null;
+      await loadCloudFiles();
+      setNotice(`${file.name} uploaded to host storage.`);
+    } catch (error) {
+      if (uploadId) void cloudRequest(`/api/cloud/uploads/${uploadId}/abort`, { method: "POST" }).catch(() => undefined);
+      setCloudError(error instanceof Error ? error.message : "Upload failed.");
+    } finally { setCloudBusy(false); setCloudProgress(null); }
   }
 
   async function backupMinecraft() {
     setCloudBusy(true); setCloudError("");
     try {
-      const response = await cloudRequest("/api/minecraft/backup", { method: "POST", headers: { "content-type": "application/json" } });
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(payload.error ?? "Minecraft backup failed.");
+      await startAndWaitForBackup();
       await loadCloudFiles();
       setNotice("Minecraft backup saved and the previous backup was overwritten.");
     } catch (error) { setCloudError(error instanceof Error ? error.message : "Minecraft backup failed."); }
@@ -403,7 +554,44 @@ function Home() {
     catch (error) { setCloudError(error instanceof Error ? error.message : "Delete failed."); }
   }
 
-  const visibleServices = useMemo(() => services.filter(service => `${service.name} ${service.kind}`.toLowerCase().includes(search.toLowerCase())), [services, search]);
+  const homepageServices = useMemo<HomepageService[]>(() => {
+    const serviceState: Record<SimulatedWebsiteStatus, ServiceState> = {
+      running: "running",
+      updating: "restarting",
+      down: "degraded",
+      maintenance: "stopped",
+      unknown: "stopped",
+    };
+    const externalServices = websites.filter((site): site is Website & { kind: "external"; url: string } => site.kind === "external" && typeof site.url === "string").map(site => {
+      const manualStatus = siteSimulationStatuses[site.slug] ?? "unknown";
+      let domain = site.url;
+      try { domain = new URL(site.url).host; } catch { /* Preserve the saved URL if parsing fails. */ }
+      return {
+        id: `external-${site.slug}`,
+        name: site.name,
+        kind: "Web app" as const,
+        state: serviceState[manualStatus],
+        health: 0,
+        cpu: -1,
+        memory: -1,
+        memoryLimit: 0,
+        port: site.url.startsWith("https:") ? 443 : 80,
+        domain,
+        uptime: "—",
+        restarts: 0,
+        boot: false,
+        checkEvery: "Manual",
+        restartPolicy: "No host control",
+        dependencies: [],
+        accent: "blue",
+        description: "External link · manual browser status",
+        externalUrl: site.url,
+        manualStatus,
+      };
+    });
+    return [...services, ...externalServices];
+  }, [services, websites, siteSimulationStatuses]);
+  const visibleServices = useMemo(() => homepageServices.filter(service => `${service.name} ${service.kind}`.toLowerCase().includes(search.toLowerCase())), [homepageServices, search]);
   const running = services.filter(service => service.state === "running").length;
   const degraded = services.filter(service => service.state === "degraded").length;
 
@@ -411,11 +599,10 @@ function Home() {
     if (!hostApiUrl || !supabase || !window.confirm(`${operation[0].toUpperCase()}${operation.slice(1)} the live Minecraft server?`)) return;
     setNotice(`${operation[0].toUpperCase()}${operation.slice(1)} request sent…`);
     try {
-      const { data } = await supabase.auth.getSession();
-      const response = await fetch(`${hostApiUrl}/api/minecraft/lifecycle`, { method: "POST", credentials: "include", headers: { "content-type": "application/json", Authorization: `Bearer ${data.session?.access_token ?? ""}` }, body: JSON.stringify({ action: operation }) });
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(payload.error ?? "Minecraft lifecycle request failed.");
-      setHostState(payload.state as HostState); setNotice(`Minecraft ${operation} completed.`); setDrawer(null);
+      const response = await cloudRequest("/api/minecraft/lifecycle", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action: operation }) });
+      const result = await awaitMinecraftJob(response, `Minecraft ${operation}`);
+      if (result.state) setHostState(result.state as HostState);
+      setNotice(`Minecraft ${operation} completed.`); setDrawer(null);
     } catch (error) { setNotice(error instanceof Error ? error.message : "Minecraft lifecycle request failed."); }
   }
 
@@ -497,11 +684,11 @@ function Home() {
     </aside>
     <main className="main-content">
       <header className="topbar"><button className="mobile-top-menu" onClick={() => setSidebarOpen(value => !value)} aria-label="Open navigation"><Menu size={18} /></button><div className="breadcrumbs"><span>Cluster</span><ChevronRight size={14} /><b>tmp-node-01</b><span className="slash">/</span><strong>{nav === "overview" ? "Overview" : nav[0].toUpperCase() + nav.slice(1)}</strong></div><div className="top-actions"><div className="heartbeat"><span className="heartbeat-dot" /> live · VM agent</div><button className="icon-button" title="Help"><CircleHelp size={17} /></button><button className="icon-button" title="Sign out" onClick={() => supabase?.auth.signOut()}><LogOut size={17} /></button></div></header>
-      <div className="content-scroll">{nav === "settings" ? <SettingsPanel settings={settings} viewDistance={settingsViewDistance} setViewDistance={setSettingsViewDistance} simulationDistance={settingsSimulationDistance} setSimulationDistance={setSettingsSimulationDistance} maxPlayers={settingsMaxPlayers} setMaxPlayers={setSettingsMaxPlayers} busy={settingsBusy} error={settingsError} onSaveMinecraft={saveMinecraftSettings} onBackup={backupFromSettings} onRefresh={loadSettings} /> : nav === "cloud" ? <CloudPanel files={cloudFiles} usedBytes={cloudUsedBytes} busy={cloudBusy} error={cloudError} onUpload={uploadCloudFile} onBackup={backupMinecraft} onDownload={downloadCloudFile} onDelete={deleteCloudFile} /> : nav === "websites" ? <WebsitesPanel sites={websites} busy={websiteBusy} error={websiteError} name={websiteName} setName={setWebsiteName} domain={websiteDomain} setDomain={setWebsiteDomain} onCreate={createWebsite} onDeploy={deployWebsite} onLifecycle={websiteLifecycle} onDelete={deleteWebsite} /> : <><section className="page-heading"><div><p className="eyebrow">CONTROL PLANE / PRIVATE HOST</p><h1>{nav === "overview" ? "Overview" : nav === "services" ? "Services" : nav === "logs" ? "Log stream" : nav === "alerts" ? "Owner alerts" : "Node telemetry"}</h1><p className="page-subtitle">Live host state from the connected Ubuntu supervisor.{staticPages && <><br /><span>GitHub Pages shell · commands run on the authenticated VM agent</span></>}</p></div><div className="heading-actions"><button className="button secondary" onClick={() => setDrawer("console")}><TerminalSquare size={15} /> Minecraft terminal</button><button className="button secondary" onClick={() => window.location.reload()}><RefreshCw size={15} /> Refresh</button>{staticPages ? <span className="backend-note">Live agent connected</span> : <><button className="button secondary" onClick={() => setDrawer("invite")}><Users size={15} /> Invite member</button>{isOwnerSession(session) && <button className="button primary" onClick={() => setDrawer("add")}><Plus size={16} /> Add service</button>}</>}</div></section>
+      <div className="content-scroll">{nav === "settings" ? <SettingsPanel settings={settings} viewDistance={settingsViewDistance} setViewDistance={setSettingsViewDistance} simulationDistance={settingsSimulationDistance} setSimulationDistance={setSettingsSimulationDistance} maxPlayers={settingsMaxPlayers} setMaxPlayers={setSettingsMaxPlayers} whitelist={settingsWhitelist} setWhitelist={setSettingsWhitelist} busy={settingsBusy} error={settingsError} onSaveMinecraft={saveMinecraftSettings} onBackup={backupFromSettings} onRefresh={loadSettings} /> : nav === "cloud" ? <CloudPanel files={cloudFiles} usedBytes={cloudUsedBytes} availableBytes={cloudAvailableBytes} busy={cloudBusy} progress={cloudProgress} error={cloudError} onUpload={uploadCloudFile} onBackup={backupMinecraft} onDownload={downloadCloudFile} onDelete={deleteCloudFile} /> : nav === "websites" ? <WebsitesPanel sites={websites} busy={websiteBusy} error={websiteError} name={websiteName} setName={setWebsiteName} kind={websiteKind} setKind={setWebsiteKind} target={websiteDomain} setTarget={setWebsiteDomain} simulationStatuses={siteSimulationStatuses} progress={websiteProgress} onSimulationStatus={(slug, status) => setSiteSimulationStatuses(current => ({ ...current, [slug]: status }))} onCreate={createWebsite} onDeploy={deployWebsite} onLifecycle={websiteLifecycle} onDelete={deleteWebsite} /> : <><section className="page-heading"><div><p className="eyebrow">CONTROL PLANE / PRIVATE HOST</p><h1>{nav === "overview" ? "Overview" : nav === "services" ? "Services" : nav === "logs" ? "Log stream" : nav === "alerts" ? "Owner alerts" : "Node telemetry"}</h1><p className="page-subtitle">Live host state from the connected Linux host.{staticPages && <><br /><span>GitHub Pages shell · commands run on the authenticated VM agent</span></>}</p></div><div className="heading-actions"><button className="button secondary" onClick={() => setDrawer("console")}><TerminalSquare size={15} /> Minecraft terminal</button><button className="button secondary" onClick={() => window.location.reload()}><RefreshCw size={15} /> Refresh</button>{staticPages ? <span className="backend-note">Live agent connected</span> : <><button className="button secondary" onClick={() => setDrawer("invite")}><Users size={15} /> Invite member</button>{isOwnerSession(session) && <button className="button primary" onClick={() => setDrawer("add")}><Plus size={16} /> Add service</button>}</>}</div></section>
         <div className="security-strip"><ShieldCheck size={15} /><span><b>Owner access active</b> · Supabase session verified against the configured allowlist</span><span className="strip-end">authenticated VM agent connected · commands are sent via protected RCON</span></div>
         <section className="metric-grid"><MetricCard label="LIVE SERVICES" value={`${running}`} suffix={` / ${services.length}`} detail={`${degraded} degraded`} tone="cyan" icon={ActivityIcon} /><MetricCard label="ONLINE PLAYERS" value={`${hostState.minecraft.onlinePlayers}`} suffix={` / ${hostState.minecraft.maxPlayers || "—"}`} detail="Live RCON count" icon={Users} /><MetricCard label="MEMORY" value={`${hostState.memory.usedPercent}`} suffix="%" detail={`${formatBytes(hostState.memory.totalBytes - hostState.memory.availableBytes)} used · ${formatBytes(hostState.memory.totalBytes)} total`} tone="violet" icon={MemoryStick}><div className="meter"><span style={{ width: `${hostState.memory.usedPercent}%` }} /></div></MetricCard><MetricCard label="STORAGE" value={`${hostState.disk.usedPercent}`} suffix="%" detail={`${formatBytes(hostState.disk.freeBytes)} free`} tone="amber" icon={HardDrive}><div className="meter amber"><span style={{ width: `${hostState.disk.usedPercent}%` }} /></div></MetricCard></section>
-        <section className="main-grid"><div className="panel service-panel"><div className="panel-header"><div><p className="eyebrow">SERVICE REGISTRY</p><h2>Running services <span>{visibleServices.length} visible</span></h2></div><div className="panel-tools"><div className="search-input"><Search size={14} /><input value={search} onChange={event => setSearch(event.target.value)} placeholder="Filter services" /></div><button className="icon-button"><Filter size={16} /></button><button className="icon-button"><MoreHorizontal size={16} /></button></div></div><div className="table-wrap"><table><thead><tr><th>SERVICE</th><th>STATE</th><th>HEALTH</th><th>CPU</th><th>MEMORY</th><th>UPTIME</th><th /></tr></thead><tbody>{visibleServices.map(service => <tr key={service.id} className={selected?.id === service.id ? "selected-row" : ""} onClick={() => { setSelected(service); setDrawer("service"); }}><td><div className="service-name"><ServiceIcon kind={service.kind} /><span><b>{service.name}</b><small>{service.domain ? `${service.domain} · ` : ""}{service.description}</small></span></div></td><td><StateBadge state={service.state} /></td><td><div className="health-cell"><span className="health-bar"><i className={service.health < 80 ? "warning" : ""} style={{ width: `${service.health}%` }} /></span><small>{service.health}%</small></div></td><td className="mono">{service.cpu < 0 ? "—" : `${service.cpu}%`}</td><td><div className="memory-cell"><span>{service.memory < 0 ? "—" : `${service.memory}%`}</span><span className="memory-bar"><i style={{ width: `${Math.max(0, service.memory)}%` }} /></span></div></td><td className="mono muted">{service.uptime}</td><td><button className="row-menu" onClick={event => { event.stopPropagation(); setSelected(service); setDrawer("service"); }}><MoreHorizontal size={16} /></button></td></tr>)}</tbody></table></div><div className="panel-footer"><span><span className="green-dot" /> {running} running</span><span><span className="amber-dot" /> {degraded} attention</span><button className="text-button" onClick={() => setNav("services")}>Open full registry <ArrowUpRight size={14} /></button></div></div>
-          <div className="side-stack"><div className="panel node-panel"><div className="panel-header compact"><div><p className="eyebrow">NODE TELEMETRY</p><h2>tmp-node-01</h2></div><span className="online-pill"><span /> live telemetry</span></div><div className="node-meta"><span><HardDrive size={14} /> Ubuntu 24.04 LTS</span><span><Network size={14} /> {hostState.host.architecture} · {hostState.minecraft.publicHostname}</span><span><Server size={14} /> Java {hostState.minecraft.publicHostname}:{hostState.minecraft.portJava} · Bedrock {hostState.minecraft.publicHostname}:{hostState.minecraft.portBedrock}</span></div><div className="util-chart"><div className="chart-axis"><span>80%</span><span>40%</span><span>0%</span></div><TinySparkline color="#39d9ff" /><div className="chart-labels"><span>12h ago</span><span>6h ago</span><span>now</span></div></div><div className="node-stat-row"><div><span>UPTIME</span><b>{formatUptime(hostState.host.uptimeSeconds)}</b><small>host uptime</small></div><div><span>MEMORY</span><b>{hostState.memory.usedPercent}%</b><small>used</small></div><div><span>DISK</span><b>{hostState.disk.usedPercent}%</b><small>used</small></div></div><div className="network-stats"><div className="network-stats-head"><span><Network size={13} /> NETWORK · CURRENT TRAFFIC</span><b>{hostState.network.interface} · {hostState.network.linkMbps > 0 ? `${hostState.network.linkMbps} Mbps link` : "virtual link capacity not reported"}</b></div><div className="network-rate"><div><span>DOWNLOAD NOW</span><b>{formatRate(hostState.network.rxBytesPerSecond)}</b><small>{formatBytes(hostState.network.rxBytes)} received · {hostState.network.sampleSeconds}s sample</small></div><div><span>UPLOAD NOW</span><b>{formatRate(hostState.network.txBytesPerSecond)}</b><small>{formatBytes(hostState.network.txBytes)} sent · {hostState.network.rxDropped + hostState.network.txDropped} dropped</small></div></div></div></div><div className="panel alert-panel"><div className="panel-header compact"><div><p className="eyebrow">OWNER ALERTS</p><h2>Attention queue <span className="count-badge">0</span></h2></div><button className="icon-button" onClick={() => setNav("alerts")}><ArrowUpRight size={16} /></button></div><div className="empty-state"><ShieldCheck size={18} /><p>No live alerts reported by the host agent.</p></div></div></div></section>
+        <section className="main-grid"><div className="panel service-panel"><div className="panel-header"><div><p className="eyebrow">SERVICE REGISTRY</p><h2>Services &amp; external links <span>{visibleServices.length} visible</span></h2></div><div className="panel-tools"><div className="search-input"><Search size={14} /><input value={search} onChange={event => setSearch(event.target.value)} placeholder="Filter services" /></div><button className="icon-button"><Filter size={16} /></button><button className="icon-button"><MoreHorizontal size={16} /></button></div></div><div className="table-wrap"><table><thead><tr><th>SERVICE</th><th>STATE</th><th>HEALTH</th><th>CPU</th><th>MEMORY</th><th>UPTIME</th><th /></tr></thead><tbody>{visibleServices.map(service => <tr key={service.id} className={selected?.id === service.id ? "selected-row" : ""} onClick={() => { if (service.externalUrl) { setNav("websites"); return; } setSelected(service); setDrawer("service"); }}><td><div className="service-name"><ServiceIcon kind={service.kind} /><span><b>{service.name}</b><small>{service.domain ? `${service.domain} · ` : ""}{service.description}</small></span></div></td><td>{service.manualStatus ? <span className={`sim-status ${service.manualStatus}`} title="Manually set in this browser; not live monitoring">{SITE_SIMULATION_OPTIONS.find(option => option.value === service.manualStatus)?.label ?? "Unknown"}</span> : <StateBadge state={service.state} />}</td><td>{service.manualStatus ? <span className="mono muted">Manual</span> : <div className="health-cell"><span className="health-bar"><i className={service.health < 80 ? "warning" : ""} style={{ width: `${service.health}%` }} /></span><small>{service.health}%</small></div>}</td><td className="mono">{service.cpu < 0 ? "—" : `${service.cpu}%`}</td><td><div className="memory-cell"><span>{service.memory < 0 ? "—" : `${service.memory}%`}</span><span className="memory-bar"><i style={{ width: `${Math.max(0, service.memory)}%` }} /></span></div></td><td className="mono muted">{service.uptime}</td><td><button className="row-menu" onClick={event => { event.stopPropagation(); if (service.externalUrl) { setNav("websites"); return; } setSelected(service); setDrawer("service"); }}><MoreHorizontal size={16} /></button></td></tr>)}</tbody></table></div><div className="panel-footer"><span><span className="green-dot" /> {running} running</span><span><span className="amber-dot" /> {degraded} attention</span><button className="text-button" onClick={() => setNav("services")}>Open full registry <ArrowUpRight size={14} /></button></div></div>
+          <div className="side-stack"><div className="panel node-panel"><div className="panel-header compact"><div><p className="eyebrow">NODE TELEMETRY</p><h2>tmp-node-01</h2></div><span className="online-pill"><span /> live telemetry</span></div><div className="node-meta"><span><HardDrive size={14} /> {hostState.host.os}</span><span><Network size={14} /> {hostState.host.architecture} · {hostState.minecraft.publicHostname}</span><span><Server size={14} /> Java {hostState.minecraft.publicHostname}:{hostState.minecraft.portJava} · Bedrock {hostState.minecraft.publicHostname}:{hostState.minecraft.portBedrock}</span></div><div className="util-chart"><div className="chart-axis"><span>80%</span><span>40%</span><span>0%</span></div><TinySparkline color="#39d9ff" /><div className="chart-labels"><span>12h ago</span><span>6h ago</span><span>now</span></div></div><div className="node-stat-row"><div><span>UPTIME</span><b>{formatUptime(hostState.host.uptimeSeconds)}</b><small>host uptime</small></div><div><span>MEMORY</span><b>{hostState.memory.usedPercent}%</b><small>used</small></div><div><span>DISK</span><b>{hostState.disk.usedPercent}%</b><small>used</small></div></div><div className="network-stats"><div className="network-stats-head"><span><Network size={13} /> NETWORK · CURRENT TRAFFIC</span><b>{hostState.network.interface} · {hostState.network.linkMbps > 0 ? `${hostState.network.linkMbps} Mbps link` : "virtual link capacity not reported"}</b></div><div className="network-rate"><div><span>DOWNLOAD NOW</span><b>{formatRate(hostState.network.rxBytesPerSecond)}</b><small>{formatBytes(hostState.network.rxBytes)} received · {hostState.network.sampleSeconds}s sample</small></div><div><span>UPLOAD NOW</span><b>{formatRate(hostState.network.txBytesPerSecond)}</b><small>{formatBytes(hostState.network.txBytes)} sent · {hostState.network.rxDropped + hostState.network.txDropped} dropped</small></div></div></div></div><div className="panel alert-panel"><div className="panel-header compact"><div><p className="eyebrow">OWNER ALERTS</p><h2>Attention queue <span className="count-badge">0</span></h2></div><button className="icon-button" onClick={() => setNav("alerts")}><ArrowUpRight size={16} /></button></div><div className="empty-state"><ShieldCheck size={18} /><p>No live alerts reported by the host agent.</p></div></div></div></section>
         <section className="bottom-grid"><div className="panel activity-panel"><div className="panel-header compact"><div><p className="eyebrow">EVENT STREAM</p><h2>Recent operations</h2></div><button className="icon-button"><MoreHorizontal size={16} /></button></div><div className="activity-list">{activity.slice(0, 5).map(item => <div className="activity-item" key={item.id}><span className={`activity-marker ${item.tone}`} /><span className="activity-time">{item.time}</span><span className="activity-service">{item.service}</span><span className="activity-message">{item.message}</span></div>)}</div></div><div className="panel log-panel"><div className="panel-header compact"><div><p className="eyebrow">LOG STREAM</p><h2>Latest output</h2></div><div className="log-controls"><select value={logFilter} onChange={event => setLogFilter(event.target.value)}><option value="all">All services</option><option value="paperless-ngx">paperless-ngx</option><option value="minecraft-survival">minecraft-survival</option></select><TerminalSquare size={15} /></div></div><div className="log-list">{initialLogs.filter(log => logFilter === "all" || log.service === logFilter).map(log => <div className="log-line" key={`${log.time}-${log.service}`}><span>{log.time}</span><b className={log.level === "WARN" ? "warn" : "info"}>{log.level}</b><strong>{log.service}</strong><p>{log.message}</p></div>)}</div></div></section>
         </>}
       </div>

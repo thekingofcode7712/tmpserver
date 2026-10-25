@@ -31,8 +31,8 @@ Set the actual values. In particular:
 - `SUPABASE_URL`, `SUPABASE_ANON_KEY`, and `OWNER_EMAIL` must match the same Supabase project and owner used by the dashboard. Use only the browser-safe anon/publishable key, never a service-role key.
 - `ALLOWED_ORIGINS` must be the exact browser origin of your dashboard, including `https://` but with no path or trailing slash. If you use more than one dashboard origin, separate exact origins with commas.
 - Set `TMP_SERVER_COMPOSE_FILE`, `TMP_SERVER_COMPOSE_PROJECT`, and `TMP_SERVER_MINECRAFT_SERVICE` to the verified Compose values. For the discussed layout, that may be `/home/<your-linux-user>/server-stack/docker-compose.yml`, `minecraft-server`, and `mc_crossplay_server`.
-- Set `PUBLIC_HOSTNAME` to the address players should use. It is display information; it does not configure router forwarding, DNS, Geyser, or Cloudflare.
-- Leave `TMP_SERVER_BACKUP_SCRIPT` unset unless that script exists and you have tested it. Start and stop can work without it; restart/update/settings/backup actions fail safely when the backup script is not configured or fails.
+- Set `PUBLIC_HOSTNAME` to the address players should use. The latest public IP reported by Geyser STUN for this host was `86.129.220.212`; use that value if it is still current, and update it if your ISP changes the address. The portal reads this field live; it does not configure router forwarding, DNS, Geyser, or Cloudflare.
+- After installing the script as described in section 6, set `TMP_SERVER_BACKUP_SCRIPT=/usr/local/bin/tmpserver-minecraft-backup`. Manual Cloud backups and the daily timer then use the same tested script.
 
 Keep `/etc/tmpserver-host-agent.env` root-owned and mode `600`; do not commit it or paste its contents into GitHub. The anon key is not an admin secret, but the file also contains private account configuration.
 
@@ -85,11 +85,42 @@ docker-compose -p minecraft-server up -d --force-recreate web-app
 
 If you serve a prebuilt static bundle instead of `pnpm dev`, rebuild the frontend after setting `VITE_HOST_API_URL`; Vite embeds `VITE_*` values into the browser bundle.
 
-## 6. Verify
+If you use hosted static sites, install the narrowly scoped route-sync helper in [CADDY_SETUP.md](CADDY_SETUP.md). External-link entries do not need Caddy.
+
+## 6. Enable daily Minecraft backup at 09:00 UTC
+
+After pulling the updated `app` directory, install the backup script and systemd units:
+
+```bash
+cd ~/server-stack/app
+sudo install -o root -g root -m 755 ops/tmpserver-minecraft-backup /usr/local/bin/tmpserver-minecraft-backup
+sudo install -o root -g root -m 644 ops/tmpserver-minecraft-backup.service /etc/systemd/system/tmpserver-minecraft-backup.service
+sudo install -o root -g root -m 644 ops/tmpserver-minecraft-backup.timer /etc/systemd/system/tmpserver-minecraft-backup.timer
+sudoedit /etc/tmpserver-host-agent.env
+```
+
+Set `TMP_SERVER_BACKUP_SCRIPT=/usr/local/bin/tmpserver-minecraft-backup` in the environment file, then enable the timer and run one immediate test backup:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart tmpserver-host-agent@triumphant.service
+sudo systemctl enable --now tmpserver-minecraft-backup.timer
+sudo systemctl start tmpserver-minecraft-backup.service
+sudo systemctl status tmpserver-minecraft-backup.service --no-pager
+sudo journalctl -u tmpserver-minecraft-backup.service -n 60 --no-pager
+ls -lh /home/triumphant/.local/share/tmpserver/cloud/minecraft-latest.tar.gz
+systemctl list-timers --all | grep tmpserver-minecraft-backup
+```
+
+The timer runs daily at 09:00 UTC and catches up after host downtime when the host boots. It writes one rolling `minecraft-latest.tar.gz` into the configured Cloud directory, replacing the previous backup atomically. The server stays online, but automatic world saves are paused during the archive and restored after success or failure. The included unit assumes the Linux account is `triumphant`; if yours differs, change `User` and `WorkingDirectory` in the service file before installing it. If `TMP_AGENT_CLOUD_ROOT` is customized, check the resulting file at that configured path instead of the default shown above.
+
+Backup jobs have a six-hour runtime safety deadline followed by a five-minute TERM-cleanup grace period. This is **not a per-file upload-size limit**: Cloud uploads and hosted ZIP transfers remain chunked and have no fixed application file-size cap. If an unusually slow backup needs longer, increase the timeout in the host agent and backup service together; the previous archive is left in place if a backup is interrupted before the atomic rename.
+
+## 7. Verify
 
 1. Open the agent hostname in a browser and complete the Cloudflare Access check.
 2. Sign in to the dashboard with the configured Supabase owner email.
 3. The dashboard should display live host state. If it does not, inspect `journalctl -u tmpserver-host-agent` and the browser network request to `/api/state`; the agent requires an allowed dashboard `Origin` and a valid Supabase access token.
 4. If the Minecraft card is degraded, confirm the exact Compose service name and that the container image supports `rcon-cli` and has RCON enabled. The agent now resolves the container through `docker compose ps -q` rather than assuming a fixed container name.
 
-The agent grants both host data access and host mutations only to the configured owner email. CORS is an origin restriction, not authentication; keep the Supabase token check and Cloudflare Access enabled. Website deployment/lifecycle features that edit Caddy configuration require a separately designed, narrow Caddy permission setup; this unit does not grant broad `sudo` access for them.
+The agent grants both host data access and host mutations only to the configured owner email. CORS is an origin restriction, not authentication; keep the Supabase token check and Cloudflare Access enabled. Active hosted-site route changes require the narrow helper in [CADDY_SETUP.md](CADDY_SETUP.md); the helper is restricted to validated static-file routes. External links do not require Caddy.

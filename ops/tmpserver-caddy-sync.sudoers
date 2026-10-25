@@ -1,0 +1,2 @@
+# Replace the account name if the Linux host agent runs as a different local user.
+triumphant ALL=(root) NOPASSWD: /usr/local/bin/tmpserver-caddy-sync ""

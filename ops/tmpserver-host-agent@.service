@@ -13,7 +13,9 @@ ExecStart=/usr/bin/python3 /home/%i/server-stack/app/host-agent.py
 Restart=on-failure
 RestartSec=3
 UMask=0077
-NoNewPrivileges=true
+# The account is already in the root-equivalent Docker group; this is needed only
+# for the exact no-argument root-owned Caddy sync helper granted in sudoers.
+NoNewPrivileges=false
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=false
@@ -22,7 +24,7 @@ ProtectKernelModules=true
 ProtectControlGroups=true
 LockPersonality=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-ReadWritePaths=/home/%i/server-stack /home/%i/.local/share/tmpserver
+ReadWritePaths=/home/%i/server-stack /home/%i/.local/share/tmpserver -/etc/caddy
 
 [Install]
 WantedBy=multi-user.target
