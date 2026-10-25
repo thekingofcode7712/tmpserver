@@ -16,31 +16,76 @@ from urllib.parse import parse_qs, urlparse
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-HOST = "127.0.0.1"
+HOST = "127.0.0.1"  # Keep the privileged agent off public interfaces; expose it only through a protected tunnel.
 PORT = int(os.environ.get("TMP_AGENT_PORT", "8787"))
-SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
-SUPABASE_ANON_KEY = os.environ["SUPABASE_ANON_KEY"]
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
 OWNER_EMAIL = os.environ.get("OWNER_EMAIL", "").strip().lower()
 ALLOWED_ORIGINS = {
     origin.strip().rstrip("/")
-    for origin in os.environ.get("ALLOWED_ORIGIN", "https://thekingofcode7712.github.io").split(",")
+    for origin in os.environ.get("ALLOWED_ORIGINS", os.environ.get("ALLOWED_ORIGIN", "")).split(",")
     if origin.strip()
 }
-ALLOWED_ORIGINS.update({"https://tmpserver.com", "https://www.tmpserver.com"})
-PUBLIC_HOSTNAME = os.environ.get("PUBLIC_HOSTNAME", "140.238.70.11")
+if not SUPABASE_URL or not SUPABASE_ANON_KEY or not OWNER_EMAIL:
+    raise RuntimeError("Set SUPABASE_URL, SUPABASE_ANON_KEY, and OWNER_EMAIL before starting the host agent.")
+if not ALLOWED_ORIGINS:
+    raise RuntimeError("Set ALLOWED_ORIGINS to the exact HTTPS origin of the dashboard.")
+if any(parsed.scheme != "https" or not parsed.netloc or parsed.path or parsed.query or parsed.fragment for parsed in map(urlparse, ALLOWED_ORIGINS)):
+    raise RuntimeError("ALLOWED_ORIGINS entries must be exact HTTPS origins with no path.")
+
+PUBLIC_HOSTNAME = os.environ.get("PUBLIC_HOSTNAME", "not-configured").strip()
 STARTED = time.time()
 NETWORK_SAMPLE = None
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_\.]{3,16}$")
 CONSOLE_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,240}$")
-COMPOSE_FILE = "/opt/tmpserver/minecraft/compose.yml"
-BACKUP_SCRIPT = "/usr/local/bin/tmpserver-minecraft-backup"
-CLOUD_ROOT = "/opt/tmpserver/cloud"
-WEBSITES_ROOT = "/opt/tmpserver/websites"
+COMPOSE_FILE = os.path.abspath(os.path.expanduser(os.environ.get("TMP_SERVER_COMPOSE_FILE", "")))
+if not COMPOSE_FILE or not os.path.isfile(COMPOSE_FILE):
+    raise RuntimeError("Set TMP_SERVER_COMPOSE_FILE to the existing Compose YAML file for your Minecraft server.")
+COMPOSE_PROJECT = os.environ.get("TMP_SERVER_COMPOSE_PROJECT", "").strip()
+MINECRAFT_SERVICE = os.environ.get("TMP_SERVER_MINECRAFT_SERVICE", "minecraft").strip()
+COMPOSE_COMMAND_SETTING = os.environ.get("TMP_COMPOSE_COMMAND", "docker compose").strip()
+if COMPOSE_COMMAND_SETTING not in {"docker compose", "docker-compose"}:
+    raise RuntimeError("TMP_COMPOSE_COMMAND must be either 'docker compose' or 'docker-compose'.")
+COMPOSE_COMMAND = ["docker-compose"] if COMPOSE_COMMAND_SETTING == "docker-compose" else ["docker", "compose"]
+if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", MINECRAFT_SERVICE):
+    raise RuntimeError("TMP_SERVER_MINECRAFT_SERVICE must be a valid Compose service name.")
+if COMPOSE_PROJECT and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", COMPOSE_PROJECT):
+    raise RuntimeError("TMP_SERVER_COMPOSE_PROJECT must be a valid Compose project name.")
+BACKUP_SCRIPT = os.path.abspath(os.path.expanduser(os.environ["TMP_SERVER_BACKUP_SCRIPT"])) if os.environ.get("TMP_SERVER_BACKUP_SCRIPT", "").strip() else ""
+DATA_ROOT = os.path.abspath(os.path.expanduser(os.environ.get("TMP_AGENT_DATA_ROOT", "~/.local/share/tmpserver")))
+CLOUD_ROOT = os.path.abspath(os.path.expanduser(os.environ.get("TMP_AGENT_CLOUD_ROOT", os.path.join(DATA_ROOT, "cloud"))))
+WEBSITES_ROOT = os.path.abspath(os.path.expanduser(os.environ.get("TMP_AGENT_WEBSITES_ROOT", os.path.join(DATA_ROOT, "websites"))))
 WEBSITES_INDEX = os.path.join(WEBSITES_ROOT, "sites.json")
-CADDYFILE = "/etc/caddy/Caddyfile"
+CADDYFILE = os.environ.get("TMP_AGENT_CADDYFILE", "/etc/caddy/Caddyfile")
 MAX_UPLOAD = 50 * 1024 * 1024
 os.makedirs(CLOUD_ROOT, exist_ok=True)
 os.makedirs(WEBSITES_ROOT, exist_ok=True)
+
+
+def compose_cmd(*args):
+    prefix = [*COMPOSE_COMMAND]
+    if COMPOSE_PROJECT:
+        prefix.extend(["-p", COMPOSE_PROJECT])
+    prefix.extend(["-f", COMPOSE_FILE])
+    return [*prefix, *args]
+
+
+def minecraft_container_id():
+    if not MINECRAFT_SERVICE:
+        return ""
+    code, output, _ = run(compose_cmd("ps", "-q", MINECRAFT_SERVICE), timeout=15)
+    return output.splitlines()[0].strip() if code == 0 and output.strip() else ""
+
+
+def run_backup(timeout=240):
+    if not BACKUP_SCRIPT:
+        return 1, "", "Set TMP_SERVER_BACKUP_SCRIPT to an installed world-backup script before using backup-dependent actions."
+    if not os.path.isfile(BACKUP_SCRIPT) or not os.access(BACKUP_SCRIPT, os.X_OK):
+        return 1, "", "Configured world-backup script is missing or not executable."
+    try:
+        return run([BACKUP_SCRIPT], timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as error:
+        return 1, "", str(error)
 
 
 def json_bytes(value):
@@ -50,6 +95,27 @@ def json_bytes(value):
 def run(command, timeout=15):
     result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
     return result.returncode, result.stdout.strip(), result.stderr.strip()
+
+
+def read_json_payload(handler, maximum=16 * 1024):
+    length = int(handler.headers.get("Content-Length", "0"))
+    if length < 0 or length > maximum:
+        raise ValueError("JSON request body is too large.")
+    raw = handler.rfile.read(length)
+    if len(raw) != length:
+        raise ValueError("JSON request body was incomplete.")
+    return json.loads(raw or b"{}")
+
+
+def host_os_name():
+    try:
+        with open("/etc/os-release", "r", encoding="utf-8") as file:
+            for line in file:
+                if line.startswith("PRETTY_NAME="):
+                    return shlex.split(line.partition("=")[2])[0]
+    except (OSError, ValueError, IndexError):
+        pass
+    return os.name
 
 
 def network_state():
@@ -121,27 +187,29 @@ def host_state():
     available = mem.get("MemAvailable", 0)
     disk = shutil.disk_usage("/")
     network = network_state()
-    health_code, health, _ = run(["docker", "inspect", "--format", "{{.State.Health.Status}}", "tmpserver-minecraft"])
+    container_id = minecraft_container_id()
+    health_code, health, _ = run(["docker", "inspect", "--format", "{{.State.Health.Status}}", container_id]) if container_id else (1, "", "Minecraft service is not running")
     if health_code != 0:
         health = "unknown"
-    list_code, list_output, _ = run(["docker", "exec", "tmpserver-minecraft", "rcon-cli", "list"])
+    list_code, list_output, _ = run(["docker", "exec", container_id, "rcon-cli", "list"]) if container_id else (1, "", "Minecraft service is not running")
     player_match = re.search(r"There are\s+(\d+)\s+of a max of\s+(\d+)\s+players online", list_output, re.IGNORECASE)
     online_players = int(player_match.group(1)) if player_match else 0
     max_players = int(player_match.group(2)) if player_match else 0
-    ps_code, ps_out, _ = run(["docker", "ps", "--format", "{{.Names}}|{{.Status}}|{{.Ports}}"])
+    ps_code, ps_out, _ = run(["docker", "ps", "--format", "{{.ID}}|{{.Names}}|{{.Status}}|{{.Ports}}"])
     services = []
     if ps_code == 0:
         for row in ps_out.splitlines():
-            name, status, ports = (row.split("|", 2) + ["", ""])[:3]
-            services.append({"name": name, "status": status, "ports": ports})
+            short_id, name, status, ports = (row.split("|", 3) + ["", "", "", ""])[:4]
+            is_minecraft = bool(container_id and (container_id.startswith(short_id) or short_id.startswith(container_id)))
+            services.append({"name": name, "status": status, "ports": ports, **({"kind": "Minecraft"} if is_minecraft else {})})
     for site in read_websites():
         services.append({"name": site["name"], "status": "running" if site.get("active") else "stopped", "ports": f"HTTPS · {site['domain']}", "kind": "Web app", "domain": site["domain"], "files": website_state(site)["files"], "bytes": website_state(site)["bytes"]})
     return {
-        "host": {"hostname": os.uname().nodename, "os": "Ubuntu 24.04", "architecture": os.uname().machine, "uptimeSeconds": round(uptime), "agentUptimeSeconds": round(time.time() - STARTED)},
+        "host": {"hostname": os.uname().nodename, "os": host_os_name(), "architecture": os.uname().machine, "uptimeSeconds": round(uptime), "agentUptimeSeconds": round(time.time() - STARTED)},
         "memory": {"totalBytes": total, "availableBytes": available, "usedPercent": round((total - available) / total * 100, 1) if total else 0},
         "disk": {"totalBytes": disk.total, "freeBytes": disk.free, "usedPercent": round((disk.total - disk.free) / disk.total * 100, 1) if disk.total else 0},
         "network": network,
-        "minecraft": {"container": "tmpserver-minecraft", "health": health, "portJava": 25565, "portBedrock": 19132, "onlinePlayers": online_players, "maxPlayers": max_players, "publicHostname": PUBLIC_HOSTNAME},
+        "minecraft": {"container": MINECRAFT_SERVICE, "health": health, "portJava": 25565, "portBedrock": 19132, "onlinePlayers": online_players, "maxPlayers": max_players, "publicHostname": PUBLIC_HOSTNAME},
         "services": services,
     }
 
@@ -211,10 +279,12 @@ def reload_caddy(sites):
         return False, str(error)
 def owner_user(user):
     return bool(user and str(user.get("email", "")).strip().lower() == OWNER_EMAIL)
+
+
 def minecraft_settings():
     values = {"viewDistance": 0, "simulationDistance": 0, "maxPlayers": 0, "whitelist": False}
     try:
-        with open(os.path.join(os.path.dirname(COMPOSE_FILE), "compose.yml"), "r", encoding="utf-8") as file:
+        with open(COMPOSE_FILE, "r", encoding="utf-8") as file:
             text = file.read()
         for key, pattern in [("viewDistance", r"VIEW_DISTANCE:\s*(\d+)"), ("simulationDistance", r"SIMULATION_DISTANCE:\s*(\d+)"), ("maxPlayers", r"MAX_PLAYERS:\s*(\d+)")]:
             match = re.search(pattern, text)
@@ -251,7 +321,7 @@ def update_minecraft_settings(payload):
     return minecraft_settings()
 def admin_snapshot():
     storage = []
-    code, output, _ = run(["df", "-P", "-B1", "/", CLOUD_ROOT, "/opt/tmpserver/websites"])
+    code, output, _ = run(["df", "-P", "-B1", "/", CLOUD_ROOT, WEBSITES_ROOT])
     if code == 0:
         for line in output.splitlines()[1:]:
             fields = line.split()
@@ -301,7 +371,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", self.cors_origin())
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        origin = self.cors_origin()
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Credentials", "true")
         self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Vary", "Origin")
@@ -315,7 +390,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(size))
         self.send_header("Content-Disposition", f'attachment; filename="{os.path.basename(path)}"')
-        self.send_header("Access-Control-Allow-Origin", self.cors_origin())
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        origin = self.cors_origin()
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Credentials", "true")
         self.send_header("Vary", "Origin")
         self.end_headers()
         with open(path, "rb") as file:
@@ -323,31 +403,49 @@ class Handler(BaseHTTPRequestHandler):
 
     def cors_origin(self):
         origin = self.headers.get("Origin", "").rstrip("/")
-        return origin if origin in ALLOWED_ORIGINS else "https://tmpserver.com"
+        return origin if origin in ALLOWED_ORIGINS else ""
+
+    def require_owner(self):
+        user = auth_user(self)
+        if not user:
+            self.send_json(401, {"error": "authenticated Supabase owner session required"})
+            return None
+        if not owner_user(user):
+            self.send_json(403, {"error": "Only the configured TMP Server owner may access host data."})
+            return None
+        return user
 
     def do_OPTIONS(self):
-        self.send_json(204, {})
+        origin = self.cors_origin()
+        if not origin:
+            self.send_response(403)
+            self.end_headers()
+            return
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", origin)
+        self.send_header("Access-Control-Allow-Credentials", "true")
+        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Vary", "Origin")
+        self.end_headers()
 
     def do_GET(self):
         if self.path == "/api/health":
-            self.send_json(200, {"ok": True, "service": "tmpserver-host-agent", "state": host_state()})
+            self.send_json(200, {"ok": True, "service": "tmpserver-host-agent"})
             return
         if self.path == "/api/cloud/files":
-            if not auth_user(self):
-                self.send_json(401, {"error": "authenticated Supabase session required"})
+            if not self.require_owner():
                 return
             self.send_json(200, {"files": cloud_files(), "usedBytes": sum(item["size"] for item in cloud_files())})
             return
         if self.path == "/api/websites":
-            if not auth_user(self):
-                self.send_json(401, {"error": "authenticated Supabase session required"})
+            if not self.require_owner():
                 return
             self.send_json(200, {"sites": [website_state(site) for site in read_websites()]})
             return
         parsed = urlparse(self.path)
         if parsed.path == "/api/cloud/download":
-            if not auth_user(self):
-                self.send_json(401, {"error": "authenticated Supabase session required"})
+            if not self.require_owner():
                 return
             path = safe_cloud_path(parse_qs(parsed.query).get("path", [""])[0])
             if not path or not os.path.isfile(path):
@@ -356,15 +454,13 @@ class Handler(BaseHTTPRequestHandler):
             self.send_file(path)
             return
         if self.path == "/api/state":
-            if not auth_user(self):
-                self.send_json(401, {"error": "authenticated Supabase session required"})
+            if not self.require_owner():
                 return
             self.send_json(200, host_state())
             return
         if self.path == "/api/settings":
-            user = auth_user(self)
+            user = self.require_owner()
             if not user:
-                self.send_json(401, {"error": "authenticated Supabase session required"})
                 return
             backup_path = os.path.join(CLOUD_ROOT, "minecraft-latest.tar.gz")
             backup_stat = os.stat(backup_path) if os.path.isfile(backup_path) else None
@@ -374,12 +470,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path in {"/api/cloud/upload", "/api/cloud/delete"}:
-            if not auth_user(self):
-                self.send_json(401, {"error": "owner or invited member session required"})
+            user = auth_user(self)
+            if not user:
+                self.send_json(401, {"error": "authenticated Supabase session required"})
+                return
+            if not owner_user(user):
+                self.send_json(403, {"error": "Only the configured TMP Server owner can change host data."})
                 return
             try:
                 length = int(self.headers.get("Content-Length", "0"))
-                if length > MAX_UPLOAD:
+                if length < 0 or length > MAX_UPLOAD:
                     self.send_json(413, {"error": "file is larger than the 50 MB limit"})
                     return
                 if self.path.endswith("/upload"):
@@ -397,6 +497,9 @@ class Handler(BaseHTTPRequestHandler):
                         shutil.copyfileobj(item.file, file)
                     self.send_json(200, {"ok": True, "file": next(item for item in cloud_files() if os.path.realpath(os.path.join(CLOUD_ROOT, item["path"])) == target)})
                     return
+                if length > 16 * 1024:
+                    self.send_json(413, {"error": "delete request is too large"})
+                    return
                 payload = json.loads(self.rfile.read(length))
                 target = safe_cloud_path(payload.get("path"))
                 if not target or not os.path.isfile(target):
@@ -412,32 +515,31 @@ class Handler(BaseHTTPRequestHandler):
         if self.path not in {"/api/minecraft/whitelist", "/api/minecraft/command", "/api/minecraft/lifecycle", "/api/minecraft/backup", "/api/minecraft/settings", "/api/websites"} and not website_match:
             self.send_json(404, {"error": "not found"})
             return
-        if not auth_user(self):
-            self.send_json(401, {"error": "owner or invited member session required"})
+        user = auth_user(self)
+        if not user:
+            self.send_json(401, {"error": "authenticated Supabase session required"})
+            return
+        if not owner_user(user):
+            self.send_json(403, {"error": "Only the configured TMP Server owner can run host controls."})
             return
         if self.path == "/api/minecraft/settings":
-            user = auth_user(self)
-            if not owner_user(user):
-                self.send_json(403, {"error": "Only the configured TMP Server owner can change Minecraft settings."})
-                return
             try:
-                length = int(self.headers.get("Content-Length", "0"))
-                payload = json.loads(self.rfile.read(length) or b"{}")
-                stop_code, stop_stdout, stop_stderr = run(["docker", "compose", "-f", COMPOSE_FILE, "stop", "minecraft"], timeout=60)
+                payload = read_json_payload(self)
+                stop_code, stop_stdout, stop_stderr = run(compose_cmd("stop", MINECRAFT_SERVICE), timeout=60)
                 if stop_code != 0:
                     self.send_json(502, {"error": "Minecraft could not be stopped safely; settings were not changed.", "detail": stop_stderr[-300:] or stop_stdout[-300:]})
                     return
-                backup_code, backup_stdout, backup_stderr = run([BACKUP_SCRIPT], timeout=240)
+                backup_code, backup_stdout, backup_stderr = run_backup(timeout=240)
                 if backup_code != 0:
-                    run(["docker", "compose", "-f", COMPOSE_FILE, "up", "-d", "minecraft"], timeout=90)
+                    run(compose_cmd("up", "-d", MINECRAFT_SERVICE), timeout=90)
                     self.send_json(502, {"error": "Minecraft backup failed; settings were not applied.", "detail": backup_stderr[-300:] or backup_stdout[-300:]})
                     return
                 try:
                     settings = update_minecraft_settings(payload)
                 except (OSError, ValueError) as error:
-                    run(["docker", "compose", "-f", COMPOSE_FILE, "up", "-d", "minecraft"], timeout=90)
+                    run(compose_cmd("up", "-d", MINECRAFT_SERVICE), timeout=90)
                     raise error
-                stop_code, stop_stdout2, stop_stderr2 = run(["docker", "compose", "-f", COMPOSE_FILE, "up", "-d", "minecraft"], timeout=90)
+                stop_code, stop_stdout2, stop_stderr2 = run(compose_cmd("up", "-d", MINECRAFT_SERVICE), timeout=90)
                 stop_stdout = f"{stop_stdout}\n{stop_stdout2}"; stop_stderr = f"{stop_stderr}\n{stop_stderr2}"
                 if stop_code != 0:
                     self.send_json(502, {"error": "Minecraft restart failed after settings change.", "detail": stop_stderr[-300:] or stop_stdout[-300:]})
@@ -450,7 +552,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/websites" or website_match:
             try:
                 length = int(self.headers.get("Content-Length", "0"))
-                if length > MAX_UPLOAD + 4096:
+                if length < 0 or length > MAX_UPLOAD + 4096:
                     self.send_json(413, {"error": "website upload is larger than the 50 MB limit"})
                     return
                 sites = read_websites()
@@ -473,7 +575,7 @@ class Handler(BaseHTTPRequestHandler):
                             shutil.copyfileobj(item.file, archive_file)
                         with zipfile.ZipFile(archive_path) as archive:
                             members = archive.infolist()
-                            if len(members) > 10000 or any(member.file_size > MAX_UPLOAD for member in members):
+                            if len(members) > 10000 or sum(member.file_size for member in members) > MAX_UPLOAD:
                                 self.send_json(413, {"error": "ZIP contains too many or too-large files."})
                                 return
                             for member in members:
@@ -557,8 +659,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": f"Website operation failed: {error}"})
                 return
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-            payload = json.loads(self.rfile.read(length))
+            payload = read_json_payload(self)
             username = str(payload.get("username", "")).strip()
             action = str(payload.get("action", "add")).strip().lower()
             command = str(payload.get("command", "")).strip()
@@ -566,7 +667,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(400, {"error": "invalid JSON"})
             return
         if self.path == "/api/minecraft/backup":
-            code, stdout, stderr = run([BACKUP_SCRIPT], timeout=240)
+            code, stdout, stderr = run_backup(timeout=240)
             if code != 0:
                 self.send_json(502, {"error": "Minecraft backup failed", "detail": stderr[-300:] or stdout[-300:]})
                 return
@@ -597,25 +698,29 @@ class Handler(BaseHTTPRequestHandler):
             if lifecycle not in {"start", "stop", "restart", "update"}:
                 self.send_json(400, {"error": "action must be start, stop, restart, or update"})
                 return
-            if lifecycle in {"stop", "restart", "update"}:
-                backup_code, backup_stdout, backup_stderr = run([BACKUP_SCRIPT], timeout=240)
+            if lifecycle in {"restart", "update"}:
+                backup_code, backup_stdout, backup_stderr = run_backup(timeout=240)
                 if backup_code != 0:
                     self.send_json(502, {"error": "Minecraft backup failed; lifecycle action was not run", "detail": backup_stderr[-300:] or backup_stdout[-300:]})
                     return
             if lifecycle == "update":
-                code, stdout, stderr = run(["docker", "compose", "-f", COMPOSE_FILE, "pull", "minecraft"], timeout=180)
+                code, stdout, stderr = run(compose_cmd("pull", MINECRAFT_SERVICE), timeout=180)
                 if code == 0:
-                    code, stdout2, stderr2 = run(["docker", "compose", "-f", COMPOSE_FILE, "up", "-d", "minecraft"], timeout=60)
+                    code, stdout2, stderr2 = run(compose_cmd("up", "-d", MINECRAFT_SERVICE), timeout=60)
                     stdout = f"{stdout}\n{stdout2}"; stderr = f"{stderr}\n{stderr2}"
             else:
-                compose_action = "up -d" if lifecycle == "start" else lifecycle
-                code, stdout, stderr = run(["docker", "compose", "-f", COMPOSE_FILE, *compose_action.split(), "minecraft"], timeout=45)
+                compose_action = ("up", "-d", MINECRAFT_SERVICE) if lifecycle == "start" else (lifecycle, MINECRAFT_SERVICE)
+                code, stdout, stderr = run(compose_cmd(*compose_action), timeout=45)
             if code != 0:
                 self.send_json(502, {"error": "Minecraft lifecycle command failed", "detail": stderr[-300:]})
                 return
             self.send_json(200, {"ok": True, "action": lifecycle, "state": host_state()})
             return
-        code, stdout, stderr = run(["docker", "exec", "tmpserver-minecraft", "rcon-cli", *command_args])
+        container_id = minecraft_container_id()
+        if not container_id:
+            self.send_json(409, {"error": "Configured Minecraft Compose service is not running."})
+            return
+        code, stdout, stderr = run(["docker", "exec", container_id, "rcon-cli", *command_args])
         if code != 0:
             self.send_json(502, {"error": "Minecraft command failed", "detail": stderr[-300:]})
             return
