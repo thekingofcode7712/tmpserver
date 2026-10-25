@@ -2,7 +2,6 @@
 import json
 import cgi
 import errno
-import io
 import mimetypes
 import os
 import re
@@ -60,7 +59,6 @@ CLOUD_ROOT = os.path.abspath(os.path.expanduser(os.environ.get("TMP_AGENT_CLOUD_
 WEBSITES_ROOT = os.path.abspath(os.path.expanduser(os.environ.get("TMP_AGENT_WEBSITES_ROOT", os.path.join(DATA_ROOT, "websites"))))
 WEBSITES_INDEX = os.path.join(WEBSITES_ROOT, "sites.json")
 CADDYFILE = os.environ.get("TMP_AGENT_CADDYFILE", "/etc/caddy/Caddyfile")
-MAX_SITE_UPLOAD = 50 * 1024 * 1024
 CLOUD_UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024
 CLOUD_UPLOADS_ROOT = os.path.join(CLOUD_ROOT, ".tmpserver-uploads")
 CLOUD_UPLOAD_LOCK = threading.RLock()
@@ -264,28 +262,33 @@ def read_cloud_upload(upload_id):
     try:
         with open(os.path.join(directory, "upload.json"), "r", encoding="utf-8") as file:
             metadata = json.load(file)
-        if not isinstance(metadata, dict) or not isinstance(metadata.get("size"), int) or metadata["size"] < 0:
+        if not isinstance(metadata, dict) or not isinstance(metadata.get("size"), int) or isinstance(metadata.get("size"), bool) or metadata["size"] < 0:
             return None
-        if not safe_cloud_path(metadata.get("path")):
+        purpose = metadata.get("purpose", "cloud")
+        if purpose == "cloud":
+            if not safe_cloud_path(metadata.get("path")):
+                return None
+        elif purpose == "website-deploy":
+            slug = str(metadata.get("siteSlug", ""))
+            if not re.fullmatch(r"[a-z0-9-]{1,48}", slug) or not any(site.get("slug") == slug and site.get("kind", "hosted") == "hosted" for site in read_websites()):
+                return None
+        else:
             return None
         return directory, metadata
     except (OSError, ValueError, json.JSONDecodeError):
         return None
 
 
-def create_cloud_upload(path_value, size):
+def create_upload_session(metadata):
+    size = metadata.get("size")
     if not isinstance(size, int) or isinstance(size, bool) or size < 0:
         raise ValueError("Upload size must be a non-negative whole number.")
-    target = safe_cloud_path(path_value)
-    if not target or os.path.isdir(target):
-        raise ValueError("Choose a file name and a safe path inside Cloud storage.")
     if size > shutil.disk_usage(CLOUD_ROOT).free:
         raise OSError(errno.ENOSPC, "Not enough free host storage for this file.")
-    relative = os.path.relpath(target, CLOUD_ROOT).replace(os.sep, "/")
     upload_id = uuid.uuid4().hex
     directory = cloud_upload_directory(upload_id)
     os.mkdir(directory, 0o700)
-    metadata = {"path": relative, "size": size, "created": int(time.time())}
+    metadata = {**metadata, "created": int(time.time())}
     try:
         with open(os.path.join(directory, "upload.json"), "x", encoding="utf-8") as file:
             json.dump(metadata, file)
@@ -295,6 +298,21 @@ def create_cloud_upload(path_value, size):
         shutil.rmtree(directory, ignore_errors=True)
         raise
     return upload_id, metadata
+
+
+def create_cloud_upload(path_value, size):
+    target = safe_cloud_path(path_value)
+    if not target or os.path.isdir(target):
+        raise ValueError("Choose a file name and a safe path inside Cloud storage.")
+    relative = os.path.relpath(target, CLOUD_ROOT).replace(os.sep, "/")
+    return create_upload_session({"purpose": "cloud", "path": relative, "size": size})
+
+
+def create_site_deploy_upload(slug, size):
+    site = next((entry for entry in read_websites() if entry.get("slug") == slug), None)
+    if not site or site.get("kind", "hosted") != "hosted":
+        raise ValueError("ZIP deployment requires an existing hosted site.")
+    return create_upload_session({"purpose": "website-deploy", "siteSlug": slug, "size": size})
 
 
 def cleanup_stale_cloud_uploads(max_age_seconds=24 * 60 * 60):
@@ -360,6 +378,64 @@ def website_state(site):
     files = sum(len(names) for _, _, names in os.walk(public_root)) if os.path.isdir(public_root) else 0
     byte_count = sum(os.path.getsize(os.path.join(root, name)) for root, _, names in os.walk(public_root) for name in names) if os.path.isdir(public_root) else 0
     return {**site, "kind": "hosted", "files": files, "bytes": byte_count}
+def deploy_website_archive(site, archive_source):
+    if site.get("kind", "hosted") != "hosted" or not re.fullmatch(r"[a-z0-9-]{1,48}", str(site.get("slug", ""))):
+        raise ValueError("ZIP deployment requires an existing hosted site.")
+    site_root = os.path.join(WEBSITES_ROOT, site["slug"])
+    os.makedirs(site_root, exist_ok=True)
+    target_root = os.path.join(site_root, "public")
+    new_root = os.path.join(site_root, ".public-new")
+    old_root = os.path.join(site_root, ".public-old")
+    if not os.path.isdir(target_root) and os.path.isdir(old_root):
+        os.replace(old_root, target_root)
+    else:
+        shutil.rmtree(old_root, ignore_errors=True)
+    shutil.rmtree(new_root, ignore_errors=True)
+
+    with tempfile.TemporaryDirectory(prefix=".tmpserver-deploy-", dir=site_root) as workspace:
+        extract_root = os.path.join(workspace, "unzipped")
+        os.mkdir(extract_root)
+        try:
+            with zipfile.ZipFile(archive_source) as archive:
+                members = archive.infolist()
+                if len(members) > 10000:
+                    raise ValueError("ZIP contains too many files (maximum 10,000 entries).")
+                expanded_size = sum(member.file_size for member in members)
+                if expanded_size > shutil.disk_usage(site_root).free:
+                    raise OSError(errno.ENOSPC, "Not enough free host storage to extract and deploy this ZIP.")
+                safe_root = os.path.realpath(extract_root)
+                for member in members:
+                    member_path = os.path.realpath(os.path.join(extract_root, member.filename))
+                    try:
+                        within_root = os.path.commonpath([safe_root, member_path]) == safe_root
+                    except ValueError:
+                        within_root = False
+                    if not within_root:
+                        raise ValueError("ZIP contains an unsafe path.")
+                archive.extractall(extract_root)
+        except zipfile.BadZipFile as error:
+            raise ValueError("The uploaded file is not a valid ZIP archive.") from error
+
+        candidate = extract_root
+        if not os.path.isfile(os.path.join(candidate, "index.html")):
+            children = [name for name in os.listdir(candidate) if os.path.isdir(os.path.join(candidate, name))]
+            if len(children) == 1 and os.path.isfile(os.path.join(candidate, children[0], "index.html")):
+                candidate = os.path.join(candidate, children[0])
+            else:
+                raise ValueError("ZIP must contain index.html at its root or in one top-level folder.")
+        os.replace(candidate, new_root)
+
+    if os.path.isdir(target_root):
+        os.replace(target_root, old_root)
+    try:
+        os.replace(new_root, target_root)
+    except Exception:
+        if os.path.isdir(old_root) and not os.path.exists(target_root):
+            os.replace(old_root, target_root)
+        raise
+    shutil.rmtree(old_root, ignore_errors=True)
+
+
 def reload_caddy(sites):
     try:
         with open(CADDYFILE, "r", encoding="utf-8") as file:
@@ -655,9 +731,24 @@ class Handler(BaseHTTPRequestHandler):
                         if any(not os.path.isfile(os.path.join(directory, f"chunk-{index:08d}.done")) for index in range(chunk_count)):
                             self.send_json(409, {"error": "Upload is incomplete; some chunks have not arrived."})
                             return
-                        target = safe_cloud_path(metadata.get("path"))
                         data_path = os.path.join(directory, "payload.bin")
-                        if not target or os.path.isdir(target) or not os.path.isfile(data_path) or os.path.getsize(data_path) != size:
+                        if not os.path.isfile(data_path) or os.path.getsize(data_path) != size:
+                            self.send_json(400, {"error": "Staged upload file is invalid."})
+                            return
+                        if metadata.get("purpose", "cloud") == "website-deploy":
+                            sites = read_websites()
+                            site = next((entry for entry in sites if entry.get("slug") == metadata.get("siteSlug") and entry.get("kind", "hosted") == "hosted"), None)
+                            if not site:
+                                self.send_json(404, {"error": "Hosted site was removed before its ZIP upload completed."})
+                                return
+                            deploy_website_archive(site, data_path)
+                            site["updated"] = int(time.time())
+                            write_websites(sites)
+                            shutil.rmtree(directory, ignore_errors=True)
+                            self.send_json(200, {"ok": True, "site": website_state(site)})
+                            return
+                        target = safe_cloud_path(metadata.get("path"))
+                        if not target or os.path.isdir(target):
                             self.send_json(400, {"error": "Upload target or staged file is invalid."})
                             return
                         os.makedirs(os.path.dirname(target), exist_ok=True)
@@ -711,7 +802,7 @@ class Handler(BaseHTTPRequestHandler):
                 status = 507 if isinstance(error, OSError) and error.errno in {errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)} else 400
                 self.send_json(status, {"error": f"cloud operation failed: {error}"})
                 return
-        website_match = re.fullmatch(r"/api/websites/([a-z0-9-]+)/(deploy|lifecycle|delete)", self.path)
+        website_match = re.fullmatch(r"/api/websites/([a-z0-9-]+)/(deploy/start|deploy|lifecycle|delete)", self.path)
         if self.path not in {"/api/minecraft/whitelist", "/api/minecraft/command", "/api/minecraft/lifecycle", "/api/minecraft/backup", "/api/minecraft/settings", "/api/websites"} and not website_match:
             self.send_json(404, {"error": "not found"})
             return
@@ -752,10 +843,16 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/websites" or website_match:
             try:
                 length = int(self.headers.get("Content-Length", "0"))
-                if length < 0 or length > MAX_SITE_UPLOAD + 4096:
-                    self.send_json(413, {"error": "website upload is larger than the 50 MB limit"})
+                if length < 0:
+                    self.send_json(400, {"error": "Invalid website upload length."})
                     return
                 sites = read_websites()
+                if website_match and website_match.group(2) == "deploy/start":
+                    payload = json.loads(self.rfile.read(length) or b"{}")
+                    upload_id, metadata = create_site_deploy_upload(website_match.group(1), payload.get("size"))
+                    chunk_count = (metadata["size"] + CLOUD_UPLOAD_CHUNK_SIZE - 1) // CLOUD_UPLOAD_CHUNK_SIZE
+                    self.send_json(201, {"ok": True, "uploadId": upload_id, "chunkSize": CLOUD_UPLOAD_CHUNK_SIZE, "totalChunks": chunk_count})
+                    return
                 if website_match and website_match.group(2) == "deploy":
                     content_type = self.headers.get("Content-Type", "")
                     if "multipart/form-data" not in content_type:
@@ -768,41 +865,13 @@ class Handler(BaseHTTPRequestHandler):
                     if not item or not site or site.get("kind", "hosted") != "hosted" or not str(item.filename or "").lower().endswith(".zip"):
                         self.send_json(400, {"error": "Choose a ZIP file for an existing website."})
                         return
-                    target_root = os.path.join(WEBSITES_ROOT, slug, "public")
-                    with tempfile.TemporaryDirectory(prefix="tmpserver-site-") as temp_root:
-                        archive_path = os.path.join(temp_root, "site.zip")
-                        with open(archive_path, "wb") as archive_file:
-                            shutil.copyfileobj(item.file, archive_file)
-                        with zipfile.ZipFile(archive_path) as archive:
-                            members = archive.infolist()
-                            if len(members) > 10000 or sum(member.file_size for member in members) > MAX_SITE_UPLOAD:
-                                self.send_json(413, {"error": "ZIP contains too many or too-large files."})
-                                return
-                            for member in members:
-                                member_path = os.path.realpath(os.path.join(temp_root, "unzipped", member.filename))
-                                safe_root = os.path.realpath(os.path.join(temp_root, "unzipped"))
-                                if not member_path.startswith(safe_root + os.sep):
-                                    self.send_json(400, {"error": "ZIP contains an unsafe path."})
-                                    return
-                            archive.extractall(os.path.join(temp_root, "unzipped"))
-                        extracted = os.path.join(temp_root, "unzipped")
-                        candidate = os.path.join(extracted, "index.html")
-                        if not os.path.isfile(candidate):
-                            children = [name for name in os.listdir(extracted) if os.path.isdir(os.path.join(extracted, name))]
-                            if len(children) == 1 and os.path.isfile(os.path.join(extracted, children[0], "index.html")):
-                                extracted = os.path.join(extracted, children[0])
-                            else:
-                                self.send_json(400, {"error": "ZIP must contain index.html at its root."})
-                                return
-                        new_root = os.path.join(target_root, ".new")
-                        shutil.rmtree(new_root, ignore_errors=True)
-                        shutil.copytree(extracted, new_root)
-                        old_root = os.path.join(target_root, ".old")
-                        shutil.rmtree(old_root, ignore_errors=True)
-                        if os.path.isdir(target_root):
-                            os.rename(target_root, old_root)
-                        os.rename(new_root, target_root)
-                        shutil.rmtree(old_root, ignore_errors=True)
+                    try:
+                        deploy_website_archive(site, item.file)
+                    except OSError as error:
+                        if error.errno in {errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)}:
+                            self.send_json(507, {"error": "Not enough free host storage to deploy this ZIP."})
+                            return
+                        raise
                     site["updated"] = int(time.time())
                     write_websites(sites)
                     self.send_json(200, {"ok": True, "site": website_state(site)})
@@ -880,7 +949,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": "Unsupported website operation."})
                 return
             except (OSError, ValueError, json.JSONDecodeError) as error:
-                self.send_json(400, {"error": f"Website operation failed: {error}"})
+                status = 507 if isinstance(error, OSError) and error.errno in {errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)} else 400
+                self.send_json(status, {"error": f"Website operation failed: {error}"})
                 return
         try:
             payload = read_json_payload(self)
