@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 import json
 import cgi
+import errno
 import io
 import mimetypes
 import os
 import re
+import threading
+import uuid
 import shlex
 import shutil
 import subprocess
@@ -57,9 +60,13 @@ CLOUD_ROOT = os.path.abspath(os.path.expanduser(os.environ.get("TMP_AGENT_CLOUD_
 WEBSITES_ROOT = os.path.abspath(os.path.expanduser(os.environ.get("TMP_AGENT_WEBSITES_ROOT", os.path.join(DATA_ROOT, "websites"))))
 WEBSITES_INDEX = os.path.join(WEBSITES_ROOT, "sites.json")
 CADDYFILE = os.environ.get("TMP_AGENT_CADDYFILE", "/etc/caddy/Caddyfile")
-MAX_UPLOAD = 50 * 1024 * 1024
+MAX_SITE_UPLOAD = 50 * 1024 * 1024
+CLOUD_UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024
+CLOUD_UPLOADS_ROOT = os.path.join(CLOUD_ROOT, ".tmpserver-uploads")
+CLOUD_UPLOAD_LOCK = threading.RLock()
 os.makedirs(CLOUD_ROOT, exist_ok=True)
 os.makedirs(WEBSITES_ROOT, exist_ok=True)
+os.makedirs(CLOUD_UPLOADS_ROOT, mode=0o700, exist_ok=True)
 
 
 def compose_cmd(*args):
@@ -203,7 +210,10 @@ def host_state():
             is_minecraft = bool(container_id and (container_id.startswith(short_id) or short_id.startswith(container_id)))
             services.append({"name": name, "status": status, "ports": ports, **({"kind": "Minecraft"} if is_minecraft else {})})
     for site in read_websites():
-        services.append({"name": site["name"], "status": "running" if site.get("active") else "stopped", "ports": f"HTTPS · {site['domain']}", "kind": "Web app", "domain": site["domain"], "files": website_state(site)["files"], "bytes": website_state(site)["bytes"]})
+        if site.get("kind", "hosted") != "hosted":
+            continue
+        site_state = website_state(site)
+        services.append({"name": site["name"], "status": "running" if site.get("active") else "stopped", "ports": f"HTTPS · {site['domain']}", "kind": "Web app", "domain": site["domain"], "files": site_state["files"], "bytes": site_state["bytes"]})
     return {
         "host": {"hostname": os.uname().nodename, "os": host_os_name(), "architecture": os.uname().machine, "uptimeSeconds": round(uptime), "agentUptimeSeconds": round(time.time() - STARTED)},
         "memory": {"totalBytes": total, "availableBytes": available, "usedPercent": round((total - available) / total * 100, 1) if total else 0},
@@ -216,21 +226,95 @@ def host_state():
 
 def safe_cloud_path(value):
     candidate = os.path.normpath(str(value or "").strip().lstrip("/"))
-    if not candidate or candidate == "." or candidate.startswith("..") or "/../" in f"/{candidate}/" or "\\" in candidate:
+    reserved = os.path.basename(CLOUD_UPLOADS_ROOT)
+    if not candidate or candidate == "." or candidate.startswith("..") or "\\" in candidate or reserved in candidate.split(os.sep):
         return None
     full = os.path.realpath(os.path.join(CLOUD_ROOT, candidate))
+    uploads_root = os.path.realpath(CLOUD_UPLOADS_ROOT)
+    if full == uploads_root or full.startswith(uploads_root + os.sep):
+        return None
     return full if full == CLOUD_ROOT or full.startswith(CLOUD_ROOT + os.sep) else None
 
 
 def cloud_files():
     result = []
-    for root, _, names in os.walk(CLOUD_ROOT):
+    for root, directories, names in os.walk(CLOUD_ROOT):
+        directories[:] = [directory for directory in directories if not (root == CLOUD_ROOT and directory == os.path.basename(CLOUD_UPLOADS_ROOT))]
         for name in names:
             full = os.path.join(root, name)
-            relative = os.path.relpath(full, CLOUD_ROOT).replace(os.sep, "/")
-            stat = os.stat(full)
+            try:
+                relative = os.path.relpath(full, CLOUD_ROOT).replace(os.sep, "/")
+                stat = os.stat(full)
+            except OSError:
+                continue
             result.append({"path": relative, "name": name, "size": stat.st_size, "modified": int(stat.st_mtime)})
     return sorted(result, key=lambda item: item["path"].lower())
+
+
+def cloud_upload_directory(upload_id):
+    if not re.fullmatch(r"[a-f0-9]{32}", str(upload_id or "")):
+        return None
+    return os.path.join(CLOUD_UPLOADS_ROOT, upload_id)
+
+
+def read_cloud_upload(upload_id):
+    directory = cloud_upload_directory(upload_id)
+    if not directory or not os.path.isdir(directory):
+        return None
+    try:
+        with open(os.path.join(directory, "upload.json"), "r", encoding="utf-8") as file:
+            metadata = json.load(file)
+        if not isinstance(metadata, dict) or not isinstance(metadata.get("size"), int) or metadata["size"] < 0:
+            return None
+        if not safe_cloud_path(metadata.get("path")):
+            return None
+        return directory, metadata
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def create_cloud_upload(path_value, size):
+    if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+        raise ValueError("Upload size must be a non-negative whole number.")
+    target = safe_cloud_path(path_value)
+    if not target or os.path.isdir(target):
+        raise ValueError("Choose a file name and a safe path inside Cloud storage.")
+    if size > shutil.disk_usage(CLOUD_ROOT).free:
+        raise OSError(errno.ENOSPC, "Not enough free host storage for this file.")
+    relative = os.path.relpath(target, CLOUD_ROOT).replace(os.sep, "/")
+    upload_id = uuid.uuid4().hex
+    directory = cloud_upload_directory(upload_id)
+    os.mkdir(directory, 0o700)
+    metadata = {"path": relative, "size": size, "created": int(time.time())}
+    try:
+        with open(os.path.join(directory, "upload.json"), "x", encoding="utf-8") as file:
+            json.dump(metadata, file)
+        with open(os.path.join(directory, "payload.bin"), "xb") as file:
+            file.truncate(size)
+    except Exception:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
+    return upload_id, metadata
+
+
+def cleanup_stale_cloud_uploads(max_age_seconds=24 * 60 * 60):
+    cutoff = time.time() - max_age_seconds
+    try:
+        entries = os.scandir(CLOUD_UPLOADS_ROOT)
+    except OSError:
+        return
+    with entries:
+        for entry in entries:
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            try:
+                if entry.stat(follow_symlinks=False).st_mtime < cutoff:
+                    shutil.rmtree(entry.path, ignore_errors=True)
+            except OSError:
+                continue
+
+
+cleanup_stale_cloud_uploads()
 def website_slug(value):
     slug = re.sub(r"[^a-z0-9-]+", "-", str(value or "").strip().lower()).strip("-")
     return slug[:48] or None
@@ -239,6 +323,23 @@ def website_domain(value):
     if not re.fullmatch(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}", domain):
         return None
     return domain
+
+def website_url(value):
+    candidate = str(value or "").strip()
+    if not candidate or any(ord(character) < 32 or character.isspace() for character in candidate):
+        return None
+    try:
+        parsed = urlparse(candidate)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname or parsed.username is not None or parsed.password is not None:
+            return None
+        parsed.port  # Force validation of an explicit port.
+    except ValueError:
+        return None
+    return candidate
+
+def normalized_website_url(value):
+    parsed = urlparse(value)
+    return parsed._replace(scheme=parsed.scheme.lower(), netloc=parsed.netloc.lower()).geturl()
 def read_websites():
     try:
         with open(WEBSITES_INDEX, "r", encoding="utf-8") as file:
@@ -252,15 +353,20 @@ def write_websites(sites):
         json.dump(sites, file, indent=2)
     os.replace(temp, WEBSITES_INDEX)
 def website_state(site):
+    kind = site.get("kind", "hosted")
+    if kind == "external":
+        return {**site, "kind": "external", "active": False, "files": 0, "bytes": 0}
     public_root = os.path.join(WEBSITES_ROOT, site["slug"], "public")
-    return {**site, "files": sum(len(names) for _, _, names in os.walk(public_root)) if os.path.isdir(public_root) else 0, "bytes": sum(os.path.getsize(os.path.join(root, name)) for root, _, names in os.walk(public_root) for name in names) if os.path.isdir(public_root) else 0}
+    files = sum(len(names) for _, _, names in os.walk(public_root)) if os.path.isdir(public_root) else 0
+    byte_count = sum(os.path.getsize(os.path.join(root, name)) for root, _, names in os.walk(public_root) for name in names) if os.path.isdir(public_root) else 0
+    return {**site, "kind": "hosted", "files": files, "bytes": byte_count}
 def reload_caddy(sites):
     try:
         with open(CADDYFILE, "r", encoding="utf-8") as file:
             base = file.read().split("\n# TMP_SERVER_WEBSITES\n", 1)[0].rstrip()
         blocks = []
         for site in sites:
-            if site.get("active"):
+            if site.get("kind", "hosted") == "hosted" and site.get("active"):
                 root = os.path.join(WEBSITES_ROOT, site["slug"], "public")
                 blocks.append(f"{site['domain']} {{\n    root * {root}\n    encode gzip\n    file_server\n}}")
         content = base + "\n\n# TMP_SERVER_WEBSITES\n" + ("\n\n".join(blocks) if blocks else "") + "\n"
@@ -436,7 +542,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/cloud/files":
             if not self.require_owner():
                 return
-            self.send_json(200, {"files": cloud_files(), "usedBytes": sum(item["size"] for item in cloud_files())})
+            files = cloud_files()
+            storage = shutil.disk_usage(CLOUD_ROOT)
+            self.send_json(200, {"files": files, "usedBytes": sum(item["size"] for item in files), "availableBytes": storage.free, "totalBytes": storage.total})
             return
         if self.path == "/api/websites":
             if not self.require_owner():
@@ -469,38 +577,129 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(404, {"error": "not found"})
 
     def do_POST(self):
-        if self.path in {"/api/cloud/upload", "/api/cloud/delete"}:
-            user = auth_user(self)
-            if not user:
-                self.send_json(401, {"error": "authenticated Supabase session required"})
-                return
-            if not owner_user(user):
-                self.send_json(403, {"error": "Only the configured TMP Server owner can change host data."})
+        cloud_upload_match = re.fullmatch(r"/api/cloud/uploads/([a-f0-9]{32})/(chunk/(\d+)|finish|abort)", self.path)
+        if self.path in {"/api/cloud/upload", "/api/cloud/upload/start", "/api/cloud/delete"} or cloud_upload_match:
+            if not self.require_owner():
                 return
             try:
-                length = int(self.headers.get("Content-Length", "0"))
-                if length < 0 or length > MAX_UPLOAD:
-                    self.send_json(413, {"error": "file is larger than the 50 MB limit"})
+                if self.path == "/api/cloud/upload/start":
+                    payload = read_json_payload(self, maximum=4096)
+                    upload_id, metadata = create_cloud_upload(payload.get("path"), payload.get("size"))
+                    chunk_count = (metadata["size"] + CLOUD_UPLOAD_CHUNK_SIZE - 1) // CLOUD_UPLOAD_CHUNK_SIZE
+                    self.send_json(201, {"ok": True, "uploadId": upload_id, "chunkSize": CLOUD_UPLOAD_CHUNK_SIZE, "totalChunks": chunk_count})
                     return
-                if self.path.endswith("/upload"):
+                if cloud_upload_match:
+                    upload_id, action, chunk_text = cloud_upload_match.groups()
+                    with CLOUD_UPLOAD_LOCK:
+                        record = read_cloud_upload(upload_id)
+                        if not record:
+                            self.send_json(404, {"error": "Upload session not found or expired."})
+                            return
+                        directory, metadata = record
+                        if action == "abort":
+                            shutil.rmtree(directory, ignore_errors=True)
+                            self.send_json(200, {"ok": True})
+                            return
+                        if action.startswith("chunk/"):
+                            index = int(chunk_text)
+                            size = metadata["size"]
+                            chunk_count = (size + CLOUD_UPLOAD_CHUNK_SIZE - 1) // CLOUD_UPLOAD_CHUNK_SIZE
+                            if index < 0 or index >= chunk_count:
+                                self.send_json(400, {"error": "Chunk number is outside this upload."})
+                                return
+                            expected_length = min(CLOUD_UPLOAD_CHUNK_SIZE, size - index * CLOUD_UPLOAD_CHUNK_SIZE)
+                            try:
+                                length = int(self.headers.get("Content-Length", "-1"))
+                            except ValueError:
+                                length = -1
+                            if length != expected_length:
+                                self.send_json(400, {"error": "Chunk size does not match the expected range."})
+                                return
+                            if length > CLOUD_UPLOAD_CHUNK_SIZE:
+                                self.send_json(413, {"error": "Upload chunk is too large."})
+                                return
+                            data_path = os.path.join(directory, "payload.bin")
+                            marker = os.path.join(directory, f"chunk-{index:08d}.done")
+                            try:
+                                if not os.path.exists(marker) and shutil.disk_usage(CLOUD_ROOT).free < length:
+                                    self.send_json(507, {"error": "Host storage ran out of free space during this upload."})
+                                    return
+                                try:
+                                    os.remove(marker)
+                                except FileNotFoundError:
+                                    pass
+                                remaining = length
+                                with open(data_path, "r+b") as file:
+                                    file.seek(index * CLOUD_UPLOAD_CHUNK_SIZE)
+                                    while remaining:
+                                        block = self.rfile.read(min(64 * 1024, remaining))
+                                        if not block:
+                                            raise ValueError("Upload chunk ended before all bytes arrived.")
+                                        file.write(block)
+                                        remaining -= len(block)
+                                    file.flush()
+                                    os.fsync(file.fileno())
+                                marker_temp = marker + ".tmp"
+                                with open(marker_temp, "w", encoding="ascii") as file:
+                                    file.write("ok")
+                                os.replace(marker_temp, marker)
+                            except OSError as error:
+                                if error.errno in {errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)}:
+                                    self.send_json(507, {"error": "Host storage ran out of free space during this upload."})
+                                    return
+                                raise
+                            self.send_json(200, {"ok": True, "chunk": index, "totalChunks": chunk_count})
+                            return
+                        size = metadata["size"]
+                        chunk_count = (size + CLOUD_UPLOAD_CHUNK_SIZE - 1) // CLOUD_UPLOAD_CHUNK_SIZE
+                        if any(not os.path.isfile(os.path.join(directory, f"chunk-{index:08d}.done")) for index in range(chunk_count)):
+                            self.send_json(409, {"error": "Upload is incomplete; some chunks have not arrived."})
+                            return
+                        target = safe_cloud_path(metadata.get("path"))
+                        data_path = os.path.join(directory, "payload.bin")
+                        if not target or os.path.isdir(target) or not os.path.isfile(data_path) or os.path.getsize(data_path) != size:
+                            self.send_json(400, {"error": "Upload target or staged file is invalid."})
+                            return
+                        os.makedirs(os.path.dirname(target), exist_ok=True)
+                        os.replace(data_path, target)
+                        shutil.rmtree(directory, ignore_errors=True)
+                        file_info = next((item for item in cloud_files() if item["path"] == metadata["path"]), None)
+                        self.send_json(200, {"ok": True, "file": file_info})
+                        return
+                if self.path == "/api/cloud/upload":
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if length < 0:
+                        self.send_json(400, {"error": "Invalid upload length."})
+                        return
                     content_type = self.headers.get("Content-Type", "")
-                    _, params = cgi.parse_header(content_type)
-                    body = self.rfile.read(length)
-                    form = cgi.FieldStorage(fp=io.BytesIO(body), headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": content_type, "CONTENT_LENGTH": str(length)})
+                    if "multipart/form-data" not in content_type.lower():
+                        self.send_json(400, {"error": "Upload a file using multipart/form-data."})
+                        return
+                    form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": content_type, "CONTENT_LENGTH": str(length)})
                     item = form["file"] if "file" in form else None
-                    target = safe_cloud_path(form.getfirst("path", "") if "path" in form else (item.filename if item else ""))
+                    relative = (form.getfirst("path", "") if "path" in form else "") or (item.filename if item else "")
+                    target = safe_cloud_path(relative)
                     if not item or not target:
-                        self.send_json(400, {"error": "choose a file and a safe path"})
+                        self.send_json(400, {"error": "Choose a file and a safe path inside Cloud storage."})
+                        return
+                    if os.path.isdir(target):
+                        self.send_json(400, {"error": "The upload target is a directory."})
                         return
                     os.makedirs(os.path.dirname(target), exist_ok=True)
-                    with open(target, "wb") as file:
-                        shutil.copyfileobj(item.file, file)
-                    self.send_json(200, {"ok": True, "file": next(item for item in cloud_files() if os.path.realpath(os.path.join(CLOUD_ROOT, item["path"])) == target)})
+                    descriptor, temporary = tempfile.mkstemp(prefix=".tmpserver-upload-", dir=os.path.dirname(target))
+                    try:
+                        with os.fdopen(descriptor, "wb") as file:
+                            shutil.copyfileobj(item.file, file, length=1024 * 1024)
+                            file.flush()
+                            os.fsync(file.fileno())
+                        os.replace(temporary, target)
+                    finally:
+                        if os.path.exists(temporary):
+                            os.remove(temporary)
+                    file_info = next((entry for entry in cloud_files() if os.path.realpath(os.path.join(CLOUD_ROOT, entry["path"])) == target), None)
+                    self.send_json(200, {"ok": True, "file": file_info})
                     return
-                if length > 16 * 1024:
-                    self.send_json(413, {"error": "delete request is too large"})
-                    return
-                payload = json.loads(self.rfile.read(length))
+                payload = read_json_payload(self, maximum=16 * 1024)
                 target = safe_cloud_path(payload.get("path"))
                 if not target or not os.path.isfile(target):
                     self.send_json(404, {"error": "file not found"})
@@ -509,7 +708,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(200, {"ok": True, "path": payload.get("path")})
                 return
             except Exception as error:
-                self.send_json(400, {"error": f"cloud operation failed: {error}"})
+                status = 507 if isinstance(error, OSError) and error.errno in {errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)} else 400
+                self.send_json(status, {"error": f"cloud operation failed: {error}"})
                 return
         website_match = re.fullmatch(r"/api/websites/([a-z0-9-]+)/(deploy|lifecycle|delete)", self.path)
         if self.path not in {"/api/minecraft/whitelist", "/api/minecraft/command", "/api/minecraft/lifecycle", "/api/minecraft/backup", "/api/minecraft/settings", "/api/websites"} and not website_match:
@@ -552,7 +752,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/websites" or website_match:
             try:
                 length = int(self.headers.get("Content-Length", "0"))
-                if length < 0 or length > MAX_UPLOAD + 4096:
+                if length < 0 or length > MAX_SITE_UPLOAD + 4096:
                     self.send_json(413, {"error": "website upload is larger than the 50 MB limit"})
                     return
                 sites = read_websites()
@@ -561,11 +761,11 @@ class Handler(BaseHTTPRequestHandler):
                     if "multipart/form-data" not in content_type:
                         self.send_json(400, {"error": "Upload a ZIP file using multipart/form-data."})
                         return
-                    form = cgi.FieldStorage(fp=io.BytesIO(self.rfile.read(length)), headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": content_type, "CONTENT_LENGTH": str(length)})
+                    form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": content_type, "CONTENT_LENGTH": str(length)})
                     item = form["file"] if "file" in form else None
                     slug = website_match.group(1)
                     site = next((entry for entry in sites if entry["slug"] == slug), None)
-                    if not item or not site or not str(item.filename or "").lower().endswith(".zip"):
+                    if not item or not site or site.get("kind", "hosted") != "hosted" or not str(item.filename or "").lower().endswith(".zip"):
                         self.send_json(400, {"error": "Choose a ZIP file for an existing website."})
                         return
                     target_root = os.path.join(WEBSITES_ROOT, slug, "public")
@@ -575,7 +775,7 @@ class Handler(BaseHTTPRequestHandler):
                             shutil.copyfileobj(item.file, archive_file)
                         with zipfile.ZipFile(archive_path) as archive:
                             members = archive.infolist()
-                            if len(members) > 10000 or sum(member.file_size for member in members) > MAX_UPLOAD:
+                            if len(members) > 10000 or sum(member.file_size for member in members) > MAX_SITE_UPLOAD:
                                 self.send_json(413, {"error": "ZIP contains too many or too-large files."})
                                 return
                             for member in members:
@@ -611,15 +811,34 @@ class Handler(BaseHTTPRequestHandler):
                 if self.path == "/api/websites":
                     name = str(payload.get("name", "")).strip()
                     slug = website_slug(payload.get("slug") or name)
-                    domain = website_domain(payload.get("domain"))
-                    if not name or not slug or not domain:
-                        self.send_json(400, {"error": "Enter a site name and a valid domain."})
+                    kind = str(payload.get("kind", "hosted")).strip().lower()
+                    if not name or not slug or kind not in {"hosted", "external"}:
+                        self.send_json(400, {"error": "Enter a site name and choose hosted or external link."})
                         return
-                    if any(site["slug"] == slug or site["domain"] == domain for site in sites):
-                        self.send_json(409, {"error": "A website with that name or domain already exists."})
+                    if any(site.get("slug") == slug for site in sites):
+                        self.send_json(409, {"error": "A site with that name already exists."})
                         return
-                    os.makedirs(os.path.join(WEBSITES_ROOT, slug, "public"), exist_ok=True)
-                    site = {"name": name[:80], "slug": slug, "domain": domain, "active": False, "created": int(time.time()), "updated": int(time.time())}
+                    created = int(time.time())
+                    if kind == "external":
+                        url = website_url(payload.get("url"))
+                        if not url:
+                            self.send_json(400, {"error": "Enter a valid absolute HTTP or HTTPS URL."})
+                            return
+                        normalized_url = normalized_website_url(url)
+                        if any(site.get("kind") == "external" and normalized_website_url(site.get("url", "")) == normalized_url for site in sites if site.get("url")):
+                            self.send_json(409, {"error": "That external link is already saved."})
+                            return
+                        site = {"kind": "external", "name": name[:80], "slug": slug, "url": url, "active": False, "created": created, "updated": created}
+                    else:
+                        domain = website_domain(payload.get("domain"))
+                        if not domain:
+                            self.send_json(400, {"error": "Enter a valid hosted-site domain."})
+                            return
+                        if any(site.get("kind", "hosted") == "hosted" and site.get("domain") == domain for site in sites):
+                            self.send_json(409, {"error": "A hosted website with that domain already exists."})
+                            return
+                        os.makedirs(os.path.join(WEBSITES_ROOT, slug, "public"), exist_ok=True)
+                        site = {"kind": "hosted", "name": name[:80], "slug": slug, "domain": domain, "active": False, "created": created, "updated": created}
                     sites.append(site)
                     write_websites(sites)
                     self.send_json(201, {"ok": True, "site": website_state(site)})
@@ -630,6 +849,9 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(404, {"error": "Website not found."})
                     return
                 if action == "lifecycle":
+                    if site.get("kind", "hosted") != "hosted":
+                        self.send_json(400, {"error": "External links do not have a server lifecycle."})
+                        return
                     operation = str(payload.get("action", "")).strip().lower()
                     if operation not in {"start", "stop"}:
                         self.send_json(400, {"error": "Website action must be start or stop."})
@@ -645,11 +867,13 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(200, {"ok": True, "site": website_state(site)})
                     return
                 if action == "delete":
-                    ok, detail = reload_caddy([item for item in sites if item["slug"] != slug])
-                    if not ok:
-                        self.send_json(502, {"error": "Could not remove the website route.", "detail": detail})
-                        return
-                    shutil.rmtree(os.path.join(WEBSITES_ROOT, slug), ignore_errors=True)
+                    remaining = [item for item in sites if item["slug"] != slug]
+                    if site.get("kind", "hosted") == "hosted":
+                        ok, detail = reload_caddy(remaining)
+                        if not ok:
+                            self.send_json(502, {"error": "Could not remove the website route.", "detail": detail})
+                            return
+                        shutil.rmtree(os.path.join(WEBSITES_ROOT, slug), ignore_errors=True)
                     write_websites([item for item in sites if item["slug"] != slug])
                     self.send_json(200, {"ok": True, "slug": slug})
                     return

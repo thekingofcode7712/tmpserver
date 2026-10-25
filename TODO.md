@@ -1,14 +1,9 @@
 
-## No sample data
-- [x] Remove all hard-coded service, uptime, utilization, log, activity, alert, and user-count fixture values from the live data module.
-- [x] Block the dashboard and lifecycle controls until a real persistent host supervisor is connected.
-- [ ] Connect a persistent Linux host agent and replace the empty live-data boundary with authenticated real metrics, logs, uptime, user counts, deployments, and service controls.
+## Independent sites and external links
+- [ ] Let the owner add any absolute HTTP or HTTPS website link to the Websites panel, whether or not it is routed through or hosted on this server; show it as a safe outbound link without deployment or lifecycle controls.
+- [ ] Preserve existing hosted-site records and behavior, and keep external links out of Caddy routing and host-service telemetry.
+- [ ] Let the owner set an external link's simulated status to Running, Updating, Down, Maintenance, or Unknown; label it as visual-only, browser-local, not a live check, and not a host action.
 
-## Live VM connection and Minecraft users
-- [x] Connect the Pages dashboard to a real Ubuntu 24.04 host agent over HTTPS, validate Supabase sessions server-side, expose actual memory/disk/container health, and allow authenticated Java or Bedrock whitelist additions through Geyser/Floodgate.
-- [ ] Replace the temporary Cloudflare Quick Tunnel with a named tunnel or user-owned DNS/TLS endpoint so the Pages-to-VM URL remains stable across VM restarts.
-
-## Minecraft operations
-- [x] Make the live Minecraft service row use the VM snapshot and connect Start, Stop, Restart, and Update to Docker Compose lifecycle actions.
-- [x] Add an authenticated Minecraft console that sends commands through RCON and shows command output.
-- [x] Show the current online player count and max-player limit from the server's RCON `list` response.
+## VM cloud storage uploads
+- [ ] Remove the arbitrary per-file upload cap for Cloud files and support large files with streamed, bounded-size chunks; show real host free space and report disk-full conditions rather than promising infinite storage.
+- [ ] Keep Cloud upload/download/delete authenticated and owner-only, path-safe, and atomic so interrupted or failed uploads do not replace existing files.
