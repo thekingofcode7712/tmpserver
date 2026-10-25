@@ -267,6 +267,11 @@ table { width: 100%; border-collapse: collapse; min-width: 720px; } th { color: 
 .settings-list span, .settings-readonly span { color: #637790; font: 600 9px "IBM Plex Mono", monospace; letter-spacing: .08em; }
 .settings-list b, .settings-readonly b { color: #cfe0ee; font: 500 11px "IBM Plex Mono", monospace; text-align: right; }
 .settings-form { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; padding: 16px; }
+.settings-checkbox { grid-column: 1 / -1; display: flex; align-items: flex-start; gap: 10px; padding: 12px; color: #cfe0ee; background: #0d1826; border: 1px solid var(--border-soft); }
+.settings-checkbox input[type="checkbox"] { flex: 0 0 auto; width: 16px; height: 16px; margin: 2px 0 0; accent-color: var(--cyan); }
+.settings-checkbox span { display: grid; gap: 4px; }
+.settings-checkbox b { font-size: 11px; font-weight: 500; }
+.settings-checkbox small { color: #7991a4; font-size: 10px; line-height: 1.45; }
 .settings-form .button { grid-column: 1 / -1; justify-self: start; }
 .settings-card > .button.full { margin: 12px 16px 0; width: calc(100% - 32px); }
 .settings-card > .route-help { margin: 10px 16px 0; }

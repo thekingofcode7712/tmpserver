@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 import json
-import cgi
+try:
+    import cgi
+except ImportError:  # Python 3.13 removed the deprecated cgi module.
+    cgi = None
 import errno
 import mimetypes
 import os
@@ -54,14 +57,20 @@ if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", MINECRAFT_SERVICE):
 if COMPOSE_PROJECT and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", COMPOSE_PROJECT):
     raise RuntimeError("TMP_SERVER_COMPOSE_PROJECT must be a valid Compose project name.")
 BACKUP_SCRIPT = os.path.abspath(os.path.expanduser(os.environ["TMP_SERVER_BACKUP_SCRIPT"])) if os.environ.get("TMP_SERVER_BACKUP_SCRIPT", "").strip() else ""
+BACKUP_TIMEOUT_SECONDS = 6 * 60 * 60
 DATA_ROOT = os.path.abspath(os.path.expanduser(os.environ.get("TMP_AGENT_DATA_ROOT", "~/.local/share/tmpserver")))
 CLOUD_ROOT = os.path.abspath(os.path.expanduser(os.environ.get("TMP_AGENT_CLOUD_ROOT", os.path.join(DATA_ROOT, "cloud"))))
 WEBSITES_ROOT = os.path.abspath(os.path.expanduser(os.environ.get("TMP_AGENT_WEBSITES_ROOT", os.path.join(DATA_ROOT, "websites"))))
 WEBSITES_INDEX = os.path.join(WEBSITES_ROOT, "sites.json")
 CADDYFILE = os.environ.get("TMP_AGENT_CADDYFILE", "/etc/caddy/Caddyfile")
+CADDY_SYNC_SCRIPT = os.path.abspath(os.path.expanduser(os.environ.get("TMP_AGENT_CADDY_SYNC_SCRIPT", "/usr/local/bin/tmpserver-caddy-sync")))
 CLOUD_UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024
 CLOUD_UPLOADS_ROOT = os.path.join(CLOUD_ROOT, ".tmpserver-uploads")
 CLOUD_UPLOAD_LOCK = threading.RLock()
+CADDY_SYNC_LOCK = threading.Lock()
+MINECRAFT_JOB_LOCK = threading.RLock()
+MINECRAFT_OPERATION_LOCK = threading.Lock()
+MINECRAFT_JOBS = {}
 os.makedirs(CLOUD_ROOT, exist_ok=True)
 os.makedirs(WEBSITES_ROOT, exist_ok=True)
 os.makedirs(CLOUD_UPLOADS_ROOT, mode=0o700, exist_ok=True)
@@ -82,15 +91,119 @@ def minecraft_container_id():
     return output.splitlines()[0].strip() if code == 0 and output.strip() else ""
 
 
-def run_backup(timeout=240):
+def wait_for_minecraft_ready(timeout=300):
+    deadline = time.monotonic() + timeout
+    last_error = "RCON is not ready yet."
+    while time.monotonic() < deadline:
+        container_id = minecraft_container_id()
+        if container_id:
+            code, stdout, stderr = run(["docker", "exec", container_id, "rcon-cli", "list"], timeout=10)
+            if code == 0:
+                return
+            last_error = stderr[-500:] or stdout[-500:] or last_error
+        time.sleep(3)
+    raise RuntimeError(f"Minecraft did not become ready within {timeout} seconds. {last_error}")
+
+
+def run_backup(timeout=None):
     if not BACKUP_SCRIPT:
         return 1, "", "Set TMP_SERVER_BACKUP_SCRIPT to an installed world-backup script before using backup-dependent actions."
     if not os.path.isfile(BACKUP_SCRIPT) or not os.access(BACKUP_SCRIPT, os.X_OK):
         return 1, "", "Configured world-backup script is missing or not executable."
     try:
-        return run([BACKUP_SCRIPT], timeout=timeout)
+        command = ["timeout", "--signal=TERM", "--kill-after=300s", f"{BACKUP_TIMEOUT_SECONDS}s", BACKUP_SCRIPT]
+        return run(command, timeout=timeout or BACKUP_TIMEOUT_SECONDS + 360)
     except (OSError, subprocess.SubprocessError) as error:
         return 1, "", str(error)
+
+
+def _execute_minecraft_job(job_id, operation):
+    try:
+        with MINECRAFT_OPERATION_LOCK:
+            result = operation()
+        status, error = "succeeded", ""
+    except Exception as exception:
+        result, status, error = {}, "failed", str(exception)
+    with MINECRAFT_JOB_LOCK:
+        job = MINECRAFT_JOBS.get(job_id)
+        if job:
+            job.update({"status": status, "error": error, "result": result, "finished": int(time.time())})
+
+
+def start_minecraft_job(kind, operation):
+    now = int(time.time())
+    with MINECRAFT_JOB_LOCK:
+        for job_id, job in list(MINECRAFT_JOBS.items()):
+            if job.get("status") != "running" and job.get("started", 0) < now - 24 * 60 * 60:
+                MINECRAFT_JOBS.pop(job_id, None)
+        for job_id, job in MINECRAFT_JOBS.items():
+            if job.get("status") == "running":
+                if kind == "backup" and job.get("kind") == "backup":
+                    return job_id
+                raise RuntimeError("Another Minecraft backup or settings operation is already in progress.")
+        job_id = uuid.uuid4().hex
+        MINECRAFT_JOBS[job_id] = {"kind": kind, "status": "running", "error": "", "result": {}, "started": now, "finished": 0}
+        while len(MINECRAFT_JOBS) > 50:
+            oldest = min(MINECRAFT_JOBS, key=lambda key: MINECRAFT_JOBS[key].get("started", 0))
+            if MINECRAFT_JOBS[oldest].get("status") == "running":
+                break
+            MINECRAFT_JOBS.pop(oldest, None)
+        threading.Thread(target=_execute_minecraft_job, args=(job_id, operation), daemon=True).start()
+        return job_id
+
+
+def minecraft_job_snapshot(job_id):
+    with MINECRAFT_JOB_LOCK:
+        job = MINECRAFT_JOBS.get(job_id)
+        return dict(job) if job else None
+
+
+def backup_job_operation():
+    code, stdout, stderr = run_backup(timeout=None)
+    if code != 0:
+        raise RuntimeError(stderr[-1000:] or stdout[-1000:] or "Backup script exited unsuccessfully.")
+    return {"output": stdout[-1000:]}
+
+
+def apply_minecraft_settings_job(settings):
+    backup_code, backup_stdout, backup_stderr = run_backup(timeout=None)
+    if backup_code != 0:
+        raise RuntimeError("Minecraft backup failed; settings were not changed. " + (backup_stderr[-800:] or backup_stdout[-800:]))
+    stop_code, stop_stdout, stop_stderr = run(compose_cmd("stop", MINECRAFT_SERVICE), timeout=60)
+    if stop_code != 0:
+        raise RuntimeError("Minecraft could not be stopped safely; settings were not changed. " + (stop_stderr[-800:] or stop_stdout[-800:]))
+    try:
+        applied = update_minecraft_settings(settings)
+    except Exception as error:
+        start_code, start_stdout, start_stderr = run(compose_cmd("up", "-d", MINECRAFT_SERVICE), timeout=120)
+        if start_code != 0:
+            raise RuntimeError(f"Settings were not applied ({error}); Minecraft could not be restarted: {(start_stderr or start_stdout)[-800:]}") from error
+        raise RuntimeError(f"Settings were not applied: {error}") from error
+    start_code, start_stdout, start_stderr = run(compose_cmd("up", "-d", MINECRAFT_SERVICE), timeout=120)
+    if start_code != 0:
+        raise RuntimeError("Settings were written, but Minecraft failed to restart. " + (start_stderr[-800:] or start_stdout[-800:]))
+    wait_for_minecraft_ready()
+    return {"settings": applied, "output": (stop_stdout + "\n" + start_stdout)[-1000:]}
+
+
+def apply_minecraft_lifecycle_job(action):
+    if action in {"restart", "update"}:
+        backup_code, backup_stdout, backup_stderr = run_backup(timeout=None)
+        if backup_code != 0:
+            raise RuntimeError("Minecraft backup failed; lifecycle action was not run. " + (backup_stderr[-800:] or backup_stdout[-800:]))
+    if action == "update":
+        code, stdout, stderr = run(compose_cmd("pull", MINECRAFT_SERVICE), timeout=180)
+        if code == 0:
+            code, stdout2, stderr2 = run(compose_cmd("up", "-d", MINECRAFT_SERVICE), timeout=120)
+            stdout, stderr = f"{stdout}\n{stdout2}", f"{stderr}\n{stderr2}"
+    else:
+        compose_action = ("up", "-d", MINECRAFT_SERVICE) if action == "start" else (action, MINECRAFT_SERVICE)
+        code, stdout, stderr = run(compose_cmd(*compose_action), timeout=120)
+    if code != 0:
+        raise RuntimeError("Minecraft lifecycle command failed. " + (stderr[-800:] or stdout[-800:]))
+    if action in {"start", "restart", "update"}:
+        wait_for_minecraft_ready()
+    return {"action": action, "state": host_state(), "output": stdout[-1000:]}
 
 
 def json_bytes(value):
@@ -370,6 +483,38 @@ def write_websites(sites):
     with open(temp, "w", encoding="utf-8") as file:
         json.dump(sites, file, indent=2)
     os.replace(temp, WEBSITES_INDEX)
+
+
+def make_website_content_readable(public_root):
+    if os.path.islink(public_root) or os.path.islink(os.path.dirname(public_root)):
+        raise ValueError("Static website directories may not be symbolic links.")
+    root_real = os.path.realpath(public_root)
+    websites_real = os.path.realpath(WEBSITES_ROOT)
+    try:
+        if os.path.commonpath((websites_real, root_real)) != websites_real:
+            raise ValueError("Website content path escapes the configured website directory.")
+    except ValueError as error:
+        raise ValueError("Website content path escapes the configured website directory.") from error
+    os.makedirs(DATA_ROOT, exist_ok=True)
+    os.chmod(DATA_ROOT, 0o711)
+    if os.path.isdir(CLOUD_ROOT):
+        os.chmod(CLOUD_ROOT, 0o700)
+    os.chmod(WEBSITES_ROOT, 0o755)
+    os.chmod(os.path.dirname(public_root), 0o755)
+    for current, directories, files in os.walk(root_real, followlinks=False):
+        for name in directories:
+            path = os.path.join(current, name)
+            if os.path.islink(path):
+                raise ValueError("Static website content may not contain symbolic links.")
+            os.chmod(path, 0o755)
+        for name in files:
+            path = os.path.join(current, name)
+            if os.path.islink(path):
+                raise ValueError("Static website content may not contain symbolic links.")
+            os.chmod(path, 0o644)
+        os.chmod(current, 0o755)
+
+
 def website_state(site):
     kind = site.get("kind", "hosted")
     if kind == "external":
@@ -434,31 +579,37 @@ def deploy_website_archive(site, archive_source):
             os.replace(old_root, target_root)
         raise
     shutil.rmtree(old_root, ignore_errors=True)
+    make_website_content_readable(target_root)
 
 
 def reload_caddy(sites):
+    pending = os.path.join(WEBSITES_ROOT, ".tmpserver-caddy-sites.json")
+    temporary = None
     try:
-        with open(CADDYFILE, "r", encoding="utf-8") as file:
-            base = file.read().split("\n# TMP_SERVER_WEBSITES\n", 1)[0].rstrip()
-        blocks = []
-        for site in sites:
-            if site.get("kind", "hosted") == "hosted" and site.get("active"):
-                root = os.path.join(WEBSITES_ROOT, site["slug"], "public")
-                blocks.append(f"{site['domain']} {{\n    root * {root}\n    encode gzip\n    file_server\n}}")
-        content = base + "\n\n# TMP_SERVER_WEBSITES\n" + ("\n\n".join(blocks) if blocks else "") + "\n"
-        fd, path = tempfile.mkstemp(prefix="tmpserver-caddy-", text=True)
-        with os.fdopen(fd, "w", encoding="utf-8") as file:
-            file.write(content)
-        code, stdout, stderr = run(["caddy", "validate", "--config", path, "--adapter", "caddyfile"], timeout=20)
-        if code != 0:
-            os.remove(path)
-            return False, stderr[-500:] or stdout[-500:]
-        shutil.copyfile(path, CADDYFILE)
-        os.remove(path)
-        code, stdout, stderr = run(["systemctl", "reload", "caddy"], timeout=20)
-        return code == 0, stderr[-500:] or stdout[-500:]
+        with CADDY_SYNC_LOCK:
+            fd, temporary = tempfile.mkstemp(prefix=".tmpserver-caddy-sites-", dir=WEBSITES_ROOT, text=True)
+            with os.fdopen(fd, "w", encoding="utf-8") as file:
+                json.dump(sites, file)
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(temporary, pending)
+            temporary = None
+            if not os.path.isfile(CADDY_SYNC_SCRIPT) or not os.access(CADDY_SYNC_SCRIPT, os.X_OK):
+                return False, "Install the root-owned Caddy sync helper and exact sudoers rule from ops/ before changing hosted routes."
+            code, stdout, stderr = run(["sudo", "-n", CADDY_SYNC_SCRIPT], timeout=60)
+            if code != 0:
+                detail = stderr[-800:] or stdout[-800:]
+                return False, detail or "Caddy sync helper failed; the site entry was not changed."
+            return True, ""
     except (OSError, subprocess.SubprocessError) as error:
         return False, str(error)
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.remove(temporary)
+        try:
+            os.remove(pending)
+        except FileNotFoundError:
+            pass
 def owner_user(user):
     return bool(user and str(user.get("email", "")).strip().lower() == OWNER_EMAIL)
 
@@ -468,38 +619,92 @@ def minecraft_settings():
     try:
         with open(COMPOSE_FILE, "r", encoding="utf-8") as file:
             text = file.read()
-        for key, pattern in [("viewDistance", r"VIEW_DISTANCE:\s*(\d+)"), ("simulationDistance", r"SIMULATION_DISTANCE:\s*(\d+)"), ("maxPlayers", r"MAX_PLAYERS:\s*(\d+)")]:
+        for key, pattern in [
+            ("viewDistance", r"(?m)^\s*VIEW_DISTANCE:\s*['\"]?(\d+)['\"]?\s*(?:#.*)?$"),
+            ("simulationDistance", r"(?m)^\s*SIMULATION_DISTANCE:\s*['\"]?(\d+)['\"]?\s*(?:#.*)?$"),
+            ("maxPlayers", r"(?m)^\s*MAX_PLAYERS:\s*['\"]?(\d+)['\"]?\s*(?:#.*)?$"),
+        ]:
             match = re.search(pattern, text)
             if match:
                 values[key] = int(match.group(1))
-        values["whitelist"] = bool(re.search(r"ENABLE_WHITELIST:\s*true", text, re.IGNORECASE))
+        values["whitelist"] = bool(re.search(r"(?mi)^\s*ENABLE_WHITELIST:\s*['\"]?true['\"]?\s*(?:#.*)?$", text))
     except (OSError, ValueError):
         pass
     return values
+
+
+def validate_minecraft_settings(payload):
+    if not isinstance(payload, dict):
+        raise ValueError("Minecraft settings must be a JSON object.")
+    parsed = {}
+    for key, label, minimum, maximum in [
+        ("viewDistance", "View distance", 2, 32),
+        ("simulationDistance", "Simulation distance", 2, 32),
+        ("maxPlayers", "Maximum players", 1, 1000),
+    ]:
+        value = payload.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, str)):
+            raise ValueError(f"{label} must be a whole number.")
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"{label} must be a whole number.")
+        if isinstance(value, str) and str(number) != value.strip():
+            raise ValueError(f"{label} must be a whole number.")
+        if not minimum <= number <= maximum:
+            raise ValueError(f"{label} must be between {minimum} and {maximum}.")
+        parsed[key] = number
+    whitelist = payload.get("whitelist", minecraft_settings()["whitelist"])
+    if not isinstance(whitelist, bool):
+        raise ValueError("Whitelist enforcement must be true or false.")
+    parsed["whitelist"] = whitelist
+    with open(COMPOSE_FILE, "r", encoding="utf-8") as file:
+        compose_text = file.read()
+    for key, value_pattern in [
+        ("VIEW_DISTANCE", r"\d+"),
+        ("SIMULATION_DISTANCE", r"\d+"),
+        ("MAX_PLAYERS", r"\d+"),
+        ("ENABLE_WHITELIST", r"(?i:true|false)"),
+    ]:
+        pattern = re.compile(rf"(?m)^\s*{key}:\s*(?P<quote>['\"]?){value_pattern}(?P=quote)\s*(?:#.*)?$")
+        if len(list(pattern.finditer(compose_text))) != 1:
+            raise ValueError(f"Minecraft compose file must contain exactly one supported {key} setting.")
+    return parsed
+
+
 def update_minecraft_settings(payload):
-    try:
-        view_distance = int(payload.get("viewDistance"))
-        simulation_distance = int(payload.get("simulationDistance"))
-        max_players = int(payload.get("maxPlayers"))
-    except (TypeError, ValueError):
-        raise ValueError("Minecraft settings must be whole numbers.")
-    if not 2 <= view_distance <= 32:
-        raise ValueError("View distance must be between 2 and 32 chunks.")
-    if not 2 <= simulation_distance <= 32:
-        raise ValueError("Simulation distance must be between 2 and 32 chunks.")
-    if not 1 <= max_players <= 1000:
-        raise ValueError("Max players must be between 1 and 1000.")
+    settings = validate_minecraft_settings(payload)
     with open(COMPOSE_FILE, "r", encoding="utf-8") as file:
         text = file.read()
-    replacements = [(r"(?m)^(\s*VIEW_DISTANCE:\s*)\d+", rf"\g<1>{view_distance}"), (r"(?m)^(\s*SIMULATION_DISTANCE:\s*)\d+", rf"\g<1>{simulation_distance}"), (r"(?m)^(\s*MAX_PLAYERS:\s*)\d+", rf"\g<1>{max_players}")]
-    for pattern, replacement in replacements:
-        text, count = re.subn(pattern, replacement, text, count=1)
-        if count != 1:
-            raise ValueError("Minecraft compose file is missing a supported setting.")
+    values = {
+        "VIEW_DISTANCE": str(settings["viewDistance"]),
+        "SIMULATION_DISTANCE": str(settings["simulationDistance"]),
+        "MAX_PLAYERS": str(settings["maxPlayers"]),
+        "ENABLE_WHITELIST": "true" if settings["whitelist"] else "false",
+    }
+    for key, value in values.items():
+        value_pattern = r"\d+" if key != "ENABLE_WHITELIST" else r"(?i:true|false)"
+        pattern = re.compile(rf"(?m)^(?P<prefix>\s*{key}:\s*)(?P<quote>['\"]?)(?P<value>{value_pattern})(?P=quote)(?P<suffix>\s*(?:#.*)?)$")
+        matches = list(pattern.finditer(text))
+        if len(matches) != 1:
+            raise ValueError(f"Minecraft compose file must contain exactly one supported {key} setting.")
+        match = matches[0]
+        replacement = f"{match.group('prefix')}{match.group('quote')}{value}{match.group('quote')}{match.group('suffix')}"
+        text = text[:match.start()] + replacement + text[match.end():]
     backup_path = f"{COMPOSE_FILE}.settings.bak"
     shutil.copy2(COMPOSE_FILE, backup_path)
-    with open(COMPOSE_FILE, "w", encoding="utf-8") as file:
-        file.write(text)
+    directory = os.path.dirname(COMPOSE_FILE)
+    fd, temporary = tempfile.mkstemp(prefix=".tmpserver-compose-", dir=directory, text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            file.write(text)
+            file.flush()
+            os.fsync(file.fileno())
+        shutil.copystat(COMPOSE_FILE, temporary)
+        os.replace(temporary, COMPOSE_FILE)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
     return minecraft_settings()
 def admin_snapshot():
     storage = []
@@ -650,6 +855,16 @@ class Handler(BaseHTTPRequestHandler):
             backup_stat = os.stat(backup_path) if os.path.isfile(backup_path) else None
             self.send_json(200, {"host": host_state()["host"], "minecraft": minecraft_settings(), "agent": {"status": "connected", "uptimeSeconds": round(time.time() - STARTED)}, "backup": {"present": bool(backup_stat), "bytes": backup_stat.st_size if backup_stat else 0, "modified": int(backup_stat.st_mtime) if backup_stat else 0}, "permissions": {"owner": owner_user(user)}, "admin": admin_snapshot()})
             return
+        job_match = re.fullmatch(r"/api/minecraft/jobs/([a-f0-9]{32})", urlparse(self.path).path)
+        if job_match:
+            if not self.require_owner():
+                return
+            job = minecraft_job_snapshot(job_match.group(1))
+            if not job:
+                self.send_json(404, {"error": "Minecraft job not found or expired."})
+                return
+            self.send_json(200, {"ok": True, **job})
+            return
         self.send_json(404, {"error": "not found"})
 
     def do_POST(self):
@@ -763,6 +978,9 @@ class Handler(BaseHTTPRequestHandler):
                         self.send_json(400, {"error": "Invalid upload length."})
                         return
                     content_type = self.headers.get("Content-Type", "")
+                    if cgi is None:
+                        self.send_json(410, {"error": "Use the chunked Cloud upload interface; the legacy multipart endpoint is unavailable on this Python version."})
+                        return
                     if "multipart/form-data" not in content_type.lower():
                         self.send_json(400, {"error": "Upload a file using multipart/form-data."})
                         return
@@ -816,26 +1034,12 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/minecraft/settings":
             try:
                 payload = read_json_payload(self)
-                stop_code, stop_stdout, stop_stderr = run(compose_cmd("stop", MINECRAFT_SERVICE), timeout=60)
-                if stop_code != 0:
-                    self.send_json(502, {"error": "Minecraft could not be stopped safely; settings were not changed.", "detail": stop_stderr[-300:] or stop_stdout[-300:]})
-                    return
-                backup_code, backup_stdout, backup_stderr = run_backup(timeout=240)
-                if backup_code != 0:
-                    run(compose_cmd("up", "-d", MINECRAFT_SERVICE), timeout=90)
-                    self.send_json(502, {"error": "Minecraft backup failed; settings were not applied.", "detail": backup_stderr[-300:] or backup_stdout[-300:]})
-                    return
-                try:
-                    settings = update_minecraft_settings(payload)
-                except (OSError, ValueError) as error:
-                    run(compose_cmd("up", "-d", MINECRAFT_SERVICE), timeout=90)
-                    raise error
-                stop_code, stop_stdout2, stop_stderr2 = run(compose_cmd("up", "-d", MINECRAFT_SERVICE), timeout=90)
-                stop_stdout = f"{stop_stdout}\n{stop_stdout2}"; stop_stderr = f"{stop_stderr}\n{stop_stderr2}"
-                if stop_code != 0:
-                    self.send_json(502, {"error": "Minecraft restart failed after settings change.", "detail": stop_stderr[-300:] or stop_stdout[-300:]})
-                    return
-                self.send_json(200, {"ok": True, "settings": settings, "state": host_state()})
+                settings = validate_minecraft_settings(payload)
+                job_id = start_minecraft_job("settings", lambda: apply_minecraft_settings_job(settings))
+                self.send_json(202, {"ok": True, "jobId": job_id, "status": "running"})
+                return
+            except RuntimeError as error:
+                self.send_json(409, {"error": str(error)})
                 return
             except (OSError, ValueError, json.JSONDecodeError) as error:
                 self.send_json(400, {"error": str(error)})
@@ -855,6 +1059,9 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 if website_match and website_match.group(2) == "deploy":
                     content_type = self.headers.get("Content-Type", "")
+                    if cgi is None:
+                        self.send_json(410, {"error": "Use the chunked ZIP deployment interface; the legacy multipart endpoint is unavailable on this Python version."})
+                        return
                     if "multipart/form-data" not in content_type:
                         self.send_json(400, {"error": "Upload a ZIP file using multipart/form-data."})
                         return
@@ -937,14 +1144,38 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 if action == "delete":
                     remaining = [item for item in sites if item["slug"] != slug]
-                    if site.get("kind", "hosted") == "hosted":
+                    is_hosted = site.get("kind", "hosted") == "hosted"
+                    was_active = is_hosted and bool(site.get("active"))
+                    if was_active:
                         ok, detail = reload_caddy(remaining)
                         if not ok:
-                            self.send_json(502, {"error": "Could not remove the website route.", "detail": detail})
+                            self.send_json(502, {"error": "Could not remove the active website route; the site record and files were preserved.", "detail": detail})
                             return
-                        shutil.rmtree(os.path.join(WEBSITES_ROOT, slug), ignore_errors=True)
-                    write_websites([item for item in sites if item["slug"] != slug])
-                    self.send_json(200, {"ok": True, "slug": slug})
+                    site_directory = os.path.join(WEBSITES_ROOT, slug) if is_hosted else ""
+                    tombstone = os.path.join(WEBSITES_ROOT, f".deleted-{slug}-{uuid.uuid4().hex}") if is_hosted else ""
+                    moved_directory = False
+                    try:
+                        if is_hosted and os.path.lexists(site_directory):
+                            os.replace(site_directory, tombstone)
+                            moved_directory = True
+                        write_websites(remaining)
+                    except OSError as error:
+                        if moved_directory and os.path.lexists(tombstone):
+                            os.replace(tombstone, site_directory)
+                        if was_active:
+                            reload_caddy(sites)
+                        self.send_json(500, {"error": "Website deletion failed; the site record and files were preserved where possible.", "detail": str(error)})
+                        return
+                    cleanup_warning = ""
+                    if moved_directory:
+                        try:
+                            if os.path.islink(tombstone) or os.path.isfile(tombstone):
+                                os.unlink(tombstone)
+                            else:
+                                shutil.rmtree(tombstone)
+                        except OSError as error:
+                            cleanup_warning = f"The website entry was removed, but some files could not be deleted: {error}"
+                    self.send_json(200, {"ok": True, "slug": slug, "warning": cleanup_warning})
                     return
                 self.send_json(400, {"error": "Unsupported website operation."})
                 return
@@ -961,11 +1192,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(400, {"error": "invalid JSON"})
             return
         if self.path == "/api/minecraft/backup":
-            code, stdout, stderr = run_backup(timeout=240)
-            if code != 0:
-                self.send_json(502, {"error": "Minecraft backup failed", "detail": stderr[-300:] or stdout[-300:]})
+            try:
+                job_id = start_minecraft_job("backup", backup_job_operation)
+            except RuntimeError as error:
+                self.send_json(409, {"error": str(error)})
                 return
-            self.send_json(200, {"ok": True, "action": "backup", "output": stdout[-1000:]})
+            self.send_json(202, {"ok": True, "action": "backup", "jobId": job_id, "status": "running"})
             return
         if self.path == "/api/minecraft/whitelist":
             if not USERNAME_RE.fullmatch(username):
@@ -992,23 +1224,12 @@ class Handler(BaseHTTPRequestHandler):
             if lifecycle not in {"start", "stop", "restart", "update"}:
                 self.send_json(400, {"error": "action must be start, stop, restart, or update"})
                 return
-            if lifecycle in {"restart", "update"}:
-                backup_code, backup_stdout, backup_stderr = run_backup(timeout=240)
-                if backup_code != 0:
-                    self.send_json(502, {"error": "Minecraft backup failed; lifecycle action was not run", "detail": backup_stderr[-300:] or backup_stdout[-300:]})
-                    return
-            if lifecycle == "update":
-                code, stdout, stderr = run(compose_cmd("pull", MINECRAFT_SERVICE), timeout=180)
-                if code == 0:
-                    code, stdout2, stderr2 = run(compose_cmd("up", "-d", MINECRAFT_SERVICE), timeout=60)
-                    stdout = f"{stdout}\n{stdout2}"; stderr = f"{stderr}\n{stderr2}"
-            else:
-                compose_action = ("up", "-d", MINECRAFT_SERVICE) if lifecycle == "start" else (lifecycle, MINECRAFT_SERVICE)
-                code, stdout, stderr = run(compose_cmd(*compose_action), timeout=45)
-            if code != 0:
-                self.send_json(502, {"error": "Minecraft lifecycle command failed", "detail": stderr[-300:]})
+            try:
+                job_id = start_minecraft_job(f"lifecycle-{lifecycle}", lambda: apply_minecraft_lifecycle_job(lifecycle))
+            except RuntimeError as error:
+                self.send_json(409, {"error": str(error)})
                 return
-            self.send_json(200, {"ok": True, "action": lifecycle, "state": host_state()})
+            self.send_json(202, {"ok": True, "action": lifecycle, "jobId": job_id, "status": "running"})
             return
         container_id = minecraft_container_id()
         if not container_id:

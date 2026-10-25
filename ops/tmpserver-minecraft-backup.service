@@ -1,0 +1,18 @@
+[Unit]
+Description=TMP Server Minecraft backup to Cloud storage
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=triumphant
+SupplementaryGroups=docker
+WorkingDirectory=/home/triumphant/server-stack/app
+EnvironmentFile=/etc/tmpserver-host-agent.env
+ExecStart=/usr/bin/timeout --signal=TERM --kill-after=300s 21600s /usr/local/bin/tmpserver-minecraft-backup
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+TimeoutStartSec=6h10min
+TimeoutStopSec=6min

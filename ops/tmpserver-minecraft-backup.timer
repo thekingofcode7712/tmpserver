@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily TMP Server Minecraft backup at 09:00 UTC
+
+[Timer]
+OnCalendar=*-*-* 09:00:00 UTC
+AccuracySec=1s
+Persistent=true
+Unit=tmpserver-minecraft-backup.service
+
+[Install]
+WantedBy=timers.target
